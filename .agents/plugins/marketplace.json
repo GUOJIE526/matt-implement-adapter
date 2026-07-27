@@ -1,0 +1,20 @@
+{
+  "name": "matt-adapter",
+  "interface": {
+    "displayName": "Matt Adapter"
+  },
+  "plugins": [
+    {
+      "name": "matt-implement-adapter",
+      "source": {
+        "source": "local",
+        "path": "./plugins/matt-implement-adapter"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

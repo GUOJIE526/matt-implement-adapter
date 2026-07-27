@@ -1,0 +1,7 @@
+interface:
+  display_name: "Matt Implement Batch Adapter"
+  short_description: "Run each Matt ticket in a fresh Codex context"
+  default_prompt: "Use $implement-ticket-batch to implement this approved ticket batch sequentially."
+
+policy:
+  allow_implicit_invocation: true

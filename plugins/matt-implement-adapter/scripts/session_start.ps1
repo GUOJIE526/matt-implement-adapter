@@ -1,0 +1,11 @@
+$context = @'
+Codex host adapter for the installed Matt skills:
+- Infer this behavior from task structure; do not require the user to name an adapter or use a trigger phrase.
+- When one request contains more than one approved implementation ticket for Matt's implement workflow, use the installed matt-implement-adapter:implement-ticket-batch skill as the outer orchestrator.
+- Run exactly one fresh sequential subagent per ticket. That worker must use the installed Matt implement skill for exactly one ticket and complete its own TDD, tests, two-axis code review, fixes, and ticket commit before the next worker starts.
+- Do not defer ticket reviews to the parent and do not replace them with an aggregate batch review.
+- Keep a single-ticket implement request in the current context.
+- Do not apply the implementation adapter to unresolved Wayfinder decision tickets.
+'@
+
+Write-Output $context
