@@ -19,19 +19,21 @@
 
 ## 從 GitHub 安裝
 
-將 `<owner>/<repo>` 換成上傳後的 GitHub repository，例如
-`my-account/matt-implement-adapter-marketplace`：
+這個 plugin 使用 `GUOJIE526/matt-implement-adapter` repository，以下指令可直接貼上，
+不需要替換任何文字：
 
 ```powershell
-codex plugin marketplace add <owner>/<repo> --ref main
+codex plugin marketplace add GUOJIE526/matt-implement-adapter --ref main
 codex plugin add matt-implement-adapter@matt-adapter
 ```
+
+以上安裝方式不需要另外安裝 `gh`，只要 Codex CLI 能透過 Git 存取 repository 即可。
 
 也可以使用完整 HTTPS 或 SSH Git URL：
 
 ```powershell
-codex plugin marketplace add https://github.com/<owner>/<repo>.git --ref main
-codex plugin marketplace add git@github.com:<owner>/<repo>.git --ref main
+codex plugin marketplace add https://github.com/GUOJIE526/matt-implement-adapter.git --ref main
+codex plugin marketplace add git@github.com:GUOJIE526/matt-implement-adapter.git --ref main
 ```
 
 私人 repository 必須先讓電腦上的 Git 能存取該 repository。
@@ -48,17 +50,6 @@ codex plugin marketplace add git@github.com:<owner>/<repo>.git --ref main
 ```powershell
 codex plugin list | Select-String "matt-implement-adapter"
 ```
-
-## 從 clone 的本機目錄安裝
-
-```powershell
-git clone https://github.com/<owner>/<repo>.git
-Set-Location <repo>
-.\install.ps1
-```
-
-`install.ps1` 會先檢查 Codex 與必要的 Matt skills，再加入本機 marketplace
-並安裝 plugin。
 
 ## 更新
 
