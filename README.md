@@ -34,7 +34,7 @@ codex plugin marketplace add https://github.com/<owner>/<repo>.git --ref main
 codex plugin marketplace add git@github.com:<owner>/<repo>.git --ref main
 ```
 
-私人 repository 必須先讓公司電腦上的 Git 能存取該 repository。
+私人 repository 必須先讓電腦上的 Git 能存取該 repository。
 
 安裝後：
 
