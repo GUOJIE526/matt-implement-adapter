@@ -1,7 +1,7 @@
 {
   "name": "matt-implement-adapter",
-  "version": "0.1.1",
-  "description": "Runs multi-ticket Matt implement work as one fresh sequential Codex subagent per ticket.",
+  "version": "0.2.0",
+  "description": "Runs multi-ticket Matt implement work with one fresh isolated Codex subagent per ticket and dependency-ordered integration.",
   "author": {
     "name": "GGHong"
   },
@@ -9,12 +9,12 @@
   "interface": {
     "displayName": "Matt Implement Adapter",
     "shortDescription": "Fresh Codex context and commit for every Matt ticket.",
-    "longDescription": "Adapts Matt's multi-ticket implement flow to Codex by running each approved implementation ticket in a fresh sequential subagent. Every ticket completes its own TDD, review, validation, and commit before the next ticket starts.",
+    "longDescription": "Adapts Matt's multi-ticket implement flow to Codex by running each approved implementation ticket in a fresh isolated worktree and subagent. Independent tickets may run in parallel; the parent integrates them in dependency order, handles conflicts and shared test resources, runs integration checks, and cleans up completed branches.",
     "developerName": "GGHong",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write"],
     "defaultPrompt": [
-      "Implement the approved tickets in dependency order."
+      "Implement the approved tickets in isolated worktrees, parallelize independent tickets, and integrate them in dependency order."
     ]
   }
 }
