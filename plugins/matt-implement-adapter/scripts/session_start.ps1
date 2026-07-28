@@ -8,6 +8,9 @@ Codex host adapter for the installed Matt skills:
 - Do not defer ticket reviews to the parent and do not replace them with an aggregate batch review.
 - Keep a single-ticket implement request in the current context.
 - Do not apply the implementation adapter to unresolved Wayfinder decision tickets.
+- Implementation briefs are optional. During batch orchestration, search the target repository for
+  matching `.scratch/**/implementation-briefs/*.md` files and pass only matching briefs to their
+  workers; missing briefs never block the normal Matt implement workflow.
 '@
 
 Write-Output $context

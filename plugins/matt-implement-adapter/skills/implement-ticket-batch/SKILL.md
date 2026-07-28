@@ -18,6 +18,30 @@ each ticket worker owns the complete Matt workflow for exactly one ticket.
 - Honor explicit handoff or stop boundaries.
 - Use the ordinary Matt `implement` workflow in the current context when there is only one ticket.
 
+## Discover optional implementation briefs
+
+Before creating worker worktrees, look for optional implementation briefs for the approved
+implementation tickets. The target repository may keep them under
+`.scratch/<feature-slug>/implementation-briefs/`; if no brief directory or matching file exists,
+continue the normal workflow without warning or blocking the batch.
+
+Run the discovery helper from the plugin root:
+
+```powershell
+python "<this-skill-directory>\..\..\scripts\implementation_brief.py" discover `
+  --repo "<main-repo-root>" `
+  --ticket "<ticket-reference>"
+```
+
+Pass `--ticket` once for every approved implementation ticket in the active batch. The helper
+returns JSON with `matched`, `missing`, and `ignored` entries. Treat only `matched` entries as
+available guidance; missing, draft, stale-looking, malformed, or ambiguous briefs are optional
+and must not stop implementation. The parent should retain the matched brief path for the
+corresponding worker and report optional discovery only when useful.
+
+Briefs are implementation guidance, not a replacement for the parent spec, ticket, repository
+instructions, or installed Matt skills. Do not pass one ticket's brief to another worker.
+
 ## Establish isolated ticket worktrees
 
 1. Resolve the main repository root and inspect the live Git status.
@@ -75,6 +99,11 @@ per-ticket workflow:
 6. Fix every accepted finding, revalidate, and amend the same ticket commit.
 7. Run the boundary finish check and return the final commit SHA, changed files, test results, review
    results, worktree path, branch, and unresolved risks.
+
+If the parent discovered an optional implementation brief for this ticket, give the worker its exact
+path and require it to read the brief before coding. Treat the brief as design guidance only; if it
+conflicts with the ticket, parent spec, repository instructions, or installed skills, follow the
+authoritative source and report the conflict.
 
 The provisional-commit bridge is required because the installed Matt `code-review` reads committed `HEAD`
 history while `implement` otherwise asks for review before the final commit.
