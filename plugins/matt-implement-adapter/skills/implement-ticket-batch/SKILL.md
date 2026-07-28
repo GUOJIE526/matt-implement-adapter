@@ -42,6 +42,10 @@ each ticket worker owns the complete Matt workflow for exactly one ticket.
 6. Keep at most one worker per ticket, but allow one fresh worker for every ticket in the current
    unblocked frontier to be active at the same time.
 
+The worktree directory name is exactly the bounded `ticket_slug(ticket)`. Do not append UUIDs,
+branch names, or other suffixes to the worktree path; the worker branch retains its unique token so
+branch names remain collision-resistant.
+
 ## Run one ticket
 
 Spawn exactly one fresh subagent with no inherited conversation turns for each frontier ticket. Give it:
