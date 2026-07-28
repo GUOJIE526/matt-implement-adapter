@@ -106,7 +106,7 @@ def start_boundary(
     else:
         worktree_root_path = Path(worktree_root).expanduser().resolve()
     worktree_root_path.mkdir(parents=True, exist_ok=True)
-    worktree_path = worktree_root_path / f"{slug}-{token}"
+    worktree_path = worktree_root_path / slug
     if worktree_path.exists():
         raise RuntimeError(f"worker worktree already exists: {worktree_path}")
 

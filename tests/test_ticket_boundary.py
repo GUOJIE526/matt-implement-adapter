@@ -88,6 +88,20 @@ class TicketBoundaryIntegrationTests(unittest.TestCase):
         self.assertEqual(git(self.repo, "branch", "--list", str(state["branch"])), "")
         self.assertEqual(git(self.repo, "status", "--porcelain=v1"), "")
 
+    def test_worktree_name_uses_only_bounded_ticket_slug(self) -> None:
+        ticket = "ticket/with-a-very-long-name-" + ("x" * 100)
+        state = self.start_ticket(ticket)
+
+        worktree_name = Path(str(state["worktree"])).name
+        self.assertEqual(worktree_name, ticket_boundary.ticket_slug(ticket))
+        self.assertLessEqual(len(worktree_name), 48)
+        self.assertTrue(str(state["branch"]).startswith(f"codex/matt-ticket/{worktree_name}-"))
+
+        self.commit_worker_change(state, "long ticket\n")
+        ticket_boundary.finish_boundary(str(state["state_path"]))
+        ticket_boundary.integrate_boundary(str(state["state_path"]), strategy="cherry-pick")
+        ticket_boundary.cleanup_boundary(str(state["state_path"]))
+
     def test_merge_ticket_then_cleanup(self) -> None:
         state = self.start_ticket("ticket-merge")
         self.commit_worker_change(state, "merge ticket\n")
