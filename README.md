@@ -93,10 +93,3 @@ codex plugin add matt-implement-adapter@matt-adapter
 ```
 
 接著開啟新的 Codex task。
-
-## 公司環境注意事項
-
-公司管理政策若啟用 `allow_managed_hooks_only`，Codex 會略過 plugin 內附的
-SessionStart hook；此時即使 plugin 顯示 installed，adapter 也不會自動注入。
-需要由公司 Codex 管理者允許 plugin hooks。
-
