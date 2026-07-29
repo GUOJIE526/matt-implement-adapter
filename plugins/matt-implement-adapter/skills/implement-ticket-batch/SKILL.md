@@ -18,29 +18,40 @@ each ticket worker owns the complete Matt workflow for exactly one ticket.
 - Honor explicit handoff or stop boundaries.
 - Use the ordinary Matt `implement` workflow in the current context when there is only one ticket.
 
-## Discover optional implementation briefs
+## Worker-owned optional implementation briefs
 
-Before creating worker worktrees, look for optional implementation briefs for the approved
-implementation tickets. The target repository may keep them under
-`.scratch/<feature-slug>/implementation-briefs/`; if no brief directory or matching file exists,
-continue the normal workflow without warning or blocking the batch.
+The parent does not discover, read, attach, inline, or mention implementation brief paths when it
+constructs a worker prompt. The parent prompt contains only the ticket, worker worktree, parent
+spec, repository instructions, and boundary information required to perform the ticket.
 
-Run the discovery helper from the plugin root:
+After the worker worktree is created, the worker resolves the plugin wrapper from the runtime plugin root
+and discovers optional briefs from inside that worktree:
 
 ```powershell
-python "<this-skill-directory>\..\..\scripts\implementation_brief.py" discover `
-  --repo "<main-repo-root>" `
-  --ticket "<ticket-reference>"
+if ([string]::IsNullOrWhiteSpace($env:PLUGIN_ROOT)) {
+  throw "PLUGIN_ROOT is not available; cannot resolve the worker brief wrapper."
+}
+
+$wrapper = Join-Path $env:PLUGIN_ROOT "scripts\discover_worker_brief.ps1"
+if (-not (Test-Path -LiteralPath $wrapper -PathType Leaf)) {
+  throw "Worker brief wrapper not found: $wrapper"
+}
+
+& $wrapper `
+  -Repo "<worker-worktree>" `
+  -Ticket "<ticket-reference>"
 ```
 
-Pass `--ticket` once for every approved implementation ticket in the active batch. The helper
-returns JSON with `matched`, `missing`, and `ignored` entries. Treat only `matched` entries as
-available guidance; missing, draft, stale-looking, malformed, or ambiguous briefs are optional
-and must not stop implementation. The parent should retain the matched brief path for the
-corresponding worker and report optional discovery only when useful.
+Treat only `matched` entries as available guidance. The worker reads a matched brief from its own
+worktree and keeps the brief body in the worker context. Missing, draft, stale-looking, malformed,
+or ambiguous briefs are optional and must not stop implementation. Do not use `@brief-path`, file
+attachments, or parent-generated brief summaries.
+
+The wrapper resolves `implementation_brief.py` from its own `$PSScriptRoot`. Do not replace
+`$env:PLUGIN_ROOT` with a host-specific absolute path in repository files or prompt templates.
 
 Briefs are implementation guidance, not a replacement for the parent spec, ticket, repository
-instructions, or installed Matt skills. Do not pass one ticket's brief to another worker.
+instructions, or installed Matt skills. Do not read or pass one ticket's brief to another worker.
 
 ## Establish isolated ticket worktrees
 
@@ -83,6 +94,9 @@ Spawn exactly one fresh subagent with no inherited conversation turns for each f
 - any shared test-resource lock, isolated database/schema, port, temporary directory, or generated-output
   directory it must use.
 
+The worker prompt must not contain a brief body, brief attachment, or `@brief-path` reference. Tell the
+worker to run the worker-local discovery command above before coding.
+
 Tell the worker to invoke the installed Matt `implement` skill for that ticket only. It owns the complete
 per-ticket workflow:
 
@@ -100,10 +114,10 @@ per-ticket workflow:
 7. Run the boundary finish check and return the final commit SHA, changed files, test results, review
    results, worktree path, branch, and unresolved risks.
 
-If the parent discovered an optional implementation brief for this ticket, give the worker its exact
-path and require it to read the brief before coding. Treat the brief as design guidance only; if it
-conflicts with the ticket, parent spec, repository instructions, or installed skills, follow the
-authoritative source and report the conflict.
+If the worker discovers an optional implementation brief for this ticket, require it to read the brief
+from the worker worktree before coding. Treat the brief as design guidance only; if it conflicts with
+the ticket, parent spec, repository instructions, or installed skills, follow the authoritative source
+and report the conflict.
 
 The provisional-commit bridge is required because the installed Matt `code-review` reads committed `HEAD`
 history while `implement` otherwise asks for review before the final commit.

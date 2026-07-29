@@ -21,7 +21,7 @@ context，容易造成 ticket 之間的需求與修改互相混淆，也不容�
 - 每張 ticket 使用一個全新、隔離 worktree 與 branch 的 subagent context。
 - 同一個未阻塞 dependency frontier 中，彼此獨立的 ticket 可以並行執行。
 - 每張 ticket 自己完成 TDD、測試、雙軸 code review、修正與單一 commit。
-- 若目標 repository 提供 optional `implementation-briefs`，adapter 會將對應 brief 傳給該 ticket 的 worker；找不到時不會阻擋原本流程。
+- 若目標 repository 提供 optional `implementation-briefs`，worker 會在自己的 worker worktree 內搜尋並讀取對應 brief；找不到時不會阻擋原本流程。
 - 主 agent 依 ticket dependency order 將完成的 branch merge 或 cherry-pick 回主線。
 - 主 agent 處理 merge conflict、共用測試資源與整合測試，最後移除已整合的 worktree 與 branch。
 - 單張 ticket 與尚未完成 Wayfinder 決策的 ticket 不套用 adapter。
@@ -34,10 +34,12 @@ context，容易造成 ticket 之間的需求與修改互相混淆，也不容�
 .scratch/<feature-slug>/implementation-briefs/
 ```
 
-adapter 在建立 worker 前會搜尋與 active implementation tickets 相符的 Markdown brief，並只將
-匹配的 brief path 傳給對應 worker。Brief 是 implementation guidance，不會取代 parent spec、ticket、
-repository instructions 或 Matt skills；找不到、格式不完整或無法唯一配對時，adapter 會忽略它並繼續
-正常 implement。
+worker 建立後會從 `$env:PLUGIN_ROOT\scripts\discover_worker_brief.ps1` 解析 wrapper，並在自己的
+worker worktree 內搜尋與該 ticket 相符的 Markdown brief。Wrapper 再由 `$PSScriptRoot` 找到
+`implementation_brief.py`。Parent prompt 不包含 brief path、brief body、file attachment 或
+`@brief-path`；brief 只會在 worker context 內被讀取。
+Brief 是 implementation guidance，不會取代 parent spec、ticket、repository instructions 或 Matt
+skills；找不到、格式不完整或無法唯一配對時，worker 會忽略它並繼續正常 implement。
 
 ## 安裝需求
 
