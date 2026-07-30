@@ -11,9 +11,9 @@ Codex host adapter for the installed Matt skills:
 - Implementation briefs are optional and worker-owned. The parent prompt must not include a brief
   path, brief body, file attachment, or `@brief-path` reference. Each worker must search its own
   worker worktree for matching `.scratch/**/implementation-briefs/*.md` files and read only its
-  own matched brief. Resolve the wrapper from `$env:PLUGIN_ROOT\scripts\discover_worker_brief.ps1`;
-  the wrapper resolves the Python helper from its own `$PSScriptRoot`. Missing briefs never block the
-  normal Matt implement workflow.
+  own matched brief. Resolve the wrapper relative to the loaded batch skill directory at
+  `..\..\scripts\discover_worker_brief.ps1`; the wrapper resolves the Python helper from its own
+  `$PSScriptRoot`. Missing briefs or failed discovery never block the normal Matt implement workflow.
 '@
 
 Write-Output $context

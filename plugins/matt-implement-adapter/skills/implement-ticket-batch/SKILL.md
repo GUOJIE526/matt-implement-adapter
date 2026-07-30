@@ -24,31 +24,28 @@ The parent does not discover, read, attach, inline, or mention implementation br
 constructs a worker prompt. The parent prompt contains only the ticket, worker worktree, parent
 spec, repository instructions, and boundary information required to perform the ticket.
 
-After the worker worktree is created, the worker resolves the plugin wrapper from the runtime plugin root
-and discovers optional briefs from inside that worktree:
+After the worker worktree is created, the worker resolves `<this-skill-directory>` from the directory
+containing this loaded `SKILL.md`, then discovers optional briefs from inside that worktree:
 
 ```powershell
-if ([string]::IsNullOrWhiteSpace($env:PLUGIN_ROOT)) {
-  throw "PLUGIN_ROOT is not available; cannot resolve the worker brief wrapper."
-}
-
-$wrapper = Join-Path $env:PLUGIN_ROOT "scripts\discover_worker_brief.ps1"
+$skillDirectory = "<this-skill-directory>"
+$wrapper = Join-Path $skillDirectory "..\..\scripts\discover_worker_brief.ps1"
 if (-not (Test-Path -LiteralPath $wrapper -PathType Leaf)) {
-  throw "Worker brief wrapper not found: $wrapper"
+  Write-Warning "Optional worker brief wrapper not found; continuing without a brief: $wrapper"
+} else {
+  & $wrapper `
+    -Repo "<worker-worktree>" `
+    -Ticket "<ticket-reference>"
 }
-
-& $wrapper `
-  -Repo "<worker-worktree>" `
-  -Ticket "<ticket-reference>"
 ```
 
 Treat only `matched` entries as available guidance. The worker reads a matched brief from its own
 worktree and keeps the brief body in the worker context. Missing, draft, stale-looking, malformed,
-or ambiguous briefs are optional and must not stop implementation. Do not use `@brief-path`, file
-attachments, or parent-generated brief summaries.
+ambiguous, or failed discovery is optional and must not stop implementation. Do not use `@brief-path`,
+file attachments, or parent-generated brief summaries.
 
-The wrapper resolves `implementation_brief.py` from its own `$PSScriptRoot`. Do not replace
-`$env:PLUGIN_ROOT` with a host-specific absolute path in repository files or prompt templates.
+The wrapper resolves `implementation_brief.py` from its own `$PSScriptRoot`. Do not depend on
+`$env:PLUGIN_ROOT` or put a host-specific absolute path in repository files or prompt templates.
 
 Briefs are implementation guidance, not a replacement for the parent spec, ticket, repository
 instructions, or installed Matt skills. Do not read or pass one ticket's brief to another worker.

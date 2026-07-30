@@ -34,12 +34,9 @@ context，容易造成 ticket 之間的需求與修改互相混淆，也不容�
 .scratch/<feature-slug>/implementation-briefs/
 ```
 
-worker 建立後會從 `$env:PLUGIN_ROOT\scripts\discover_worker_brief.ps1` 解析 wrapper，並在自己的
-worker worktree 內搜尋與該 ticket 相符的 Markdown brief。Wrapper 再由 `$PSScriptRoot` 找到
-`implementation_brief.py`。Parent prompt 不包含 brief path、brief body、file attachment 或
-`@brief-path`；brief 只會在 worker context 內被讀取。
-Brief 是 implementation guidance，不會取代 parent spec、ticket、repository instructions 或 Matt
-skills；找不到、格式不完整或無法唯一配對時，worker 會忽略它並繼續正常 implement。
+Brief discovery 由 worker 在自己的 worktree 內執行，adapter 會從已載入的 batch skill 位置解析
+所需工具。Brief 只作為實作參考；找不到合適內容或 discovery 失敗時，不會阻擋正常 implement
+流程。
 
 ## 安裝需求
 
