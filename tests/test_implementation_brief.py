@@ -149,6 +149,37 @@ status: approved
         self.assertEqual(len(catalog.ignored), 1)
         self.assertIn("ambiguous", catalog.ignored[0].reason)
 
+    def test_ticket_path_selects_matching_source_ticket_across_features(self) -> None:
+        write_brief(
+            self.root,
+            ".scratch/first/implementation-briefs/01-login.md",
+            """---
+ticket: 01
+source_ticket: .scratch/first/issues/01-login.md
+status: approved
+---
+""",
+        )
+        expected_path = write_brief(
+            self.root,
+            ".scratch/second/implementation-briefs/01-login.md",
+            """---
+ticket: 01
+source_ticket: .scratch/second/issues/01-login.md
+status: approved
+---
+""",
+        )
+
+        catalog = implementation_brief.discover_briefs(
+            self.root,
+            [".scratch/second/issues/01-login.md"],
+        )
+
+        self.assertTrue(catalog.found)
+        self.assertEqual(catalog.matched["1"].path, expected_path.resolve())
+        self.assertEqual(catalog.missing, ())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +82,24 @@ def normalize_ticket_id(value: str | int | None) -> str | None:
         return str(int(numeric_match.group(1)))
 
     return text.casefold()
+
+
+def _normalize_ticket_path(value: str | None, repo_root: Path) -> str | None:
+    if value is None:
+        return None
+
+    text = value.strip().replace("\\", "/")
+    if not text or "/" not in text:
+        return None
+
+    path = Path(text)
+    if path.is_absolute():
+        try:
+            path = path.resolve().relative_to(repo_root)
+        except ValueError:
+            path = path.resolve()
+
+    return os.path.normcase(path.as_posix().removeprefix("./")).replace("\\", "/")
 
 
 def parse_front_matter(text: str) -> dict[str, str]:
@@ -169,11 +188,15 @@ def discover_briefs(
     """Find optional briefs matching the requested tickets without blocking on misses."""
 
     root = Path(repo_root).expanduser().resolve()
-    requested_ids: list[str] = []
+    requested_tickets: list[tuple[str, str | None]] = []
     for ticket in tickets:
         ticket_id = normalize_ticket_id(ticket)
-        if ticket_id is not None and ticket_id not in requested_ids:
-            requested_ids.append(ticket_id)
+        if ticket_id is None:
+            continue
+        ticket_path = _normalize_ticket_path(ticket, root)
+        requested_ticket = (ticket_id, ticket_path)
+        if requested_ticket not in requested_tickets:
+            requested_tickets.append(requested_ticket)
 
     candidates: dict[str, list[BriefReference]] = {}
     ignored: list[IgnoredBrief] = []
@@ -187,8 +210,14 @@ def discover_briefs(
 
     matched: dict[str, BriefReference] = {}
     missing: list[str] = []
-    for ticket_id in requested_ids:
+    for ticket_id, ticket_path in requested_tickets:
         records = candidates.get(ticket_id, [])
+        if len(records) > 1 and ticket_path is not None:
+            records = [
+                record
+                for record in records
+                if _normalize_ticket_path(record.source_ticket, root) == ticket_path
+            ]
         if len(records) == 1:
             matched[ticket_id] = records[0]
         elif len(records) > 1:
