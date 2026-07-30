@@ -70,6 +70,7 @@ status: ready-for-implement
             ".scratch/add-login/implementation-briefs/01-login.md",
             """---
 ticket: 01
+source_ticket: .scratch/add-login/issues/01-login.md
 status: approved
 ---
 """,
@@ -179,6 +180,83 @@ status: approved
         self.assertTrue(catalog.found)
         self.assertEqual(catalog.matched["1"].path, expected_path.resolve())
         self.assertEqual(catalog.missing, ())
+
+    def test_ticket_path_does_not_match_unique_other_feature(self) -> None:
+        write_brief(
+            self.root,
+            ".scratch/other/implementation-briefs/02-search.md",
+            """---
+ticket: 02
+source_ticket: .scratch/other/issues/02-search.md
+status: approved
+---
+""",
+        )
+
+        catalog = implementation_brief.discover_briefs(
+            self.root,
+            [".scratch/requested/issues/02-search.md"],
+        )
+
+        self.assertFalse(catalog.found)
+        self.assertEqual(catalog.matched, {})
+        self.assertEqual(catalog.missing, ("2",))
+
+    def test_ticket_path_does_not_match_other_feature_when_correct_brief_blocked(
+        self,
+    ) -> None:
+        blocked_path = write_brief(
+            self.root,
+            ".scratch/requested/implementation-briefs/02-search.md",
+            """---
+ticket: 02
+source_ticket: .scratch/requested/issues/02-search.md
+status: blocked
+---
+""",
+        )
+        write_brief(
+            self.root,
+            ".scratch/other/implementation-briefs/02-search.md",
+            """---
+ticket: 02
+source_ticket: .scratch/other/issues/02-search.md
+status: approved
+---
+""",
+        )
+
+        catalog = implementation_brief.discover_briefs(
+            self.root,
+            [".scratch/requested/issues/02-search.md"],
+        )
+
+        self.assertFalse(catalog.found)
+        self.assertEqual(catalog.matched, {})
+        self.assertEqual(catalog.missing, ("2",))
+        self.assertTrue(
+            any(
+                ignored.path == blocked_path.resolve()
+                and ignored.reason == "status=blocked"
+                for ignored in catalog.ignored
+            )
+        )
+
+    def test_ticket_path_requires_source_ticket_metadata(self) -> None:
+        write_brief(
+            self.root,
+            ".scratch/requested/implementation-briefs/02-search.md",
+            "---\nticket: 02\nstatus: approved\n---\n",
+        )
+
+        catalog = implementation_brief.discover_briefs(
+            self.root,
+            [".scratch/requested/issues/02-search.md"],
+        )
+
+        self.assertFalse(catalog.found)
+        self.assertEqual(catalog.matched, {})
+        self.assertEqual(catalog.missing, ("2",))
 
 
 if __name__ == "__main__":

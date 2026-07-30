@@ -212,7 +212,7 @@ def discover_briefs(
     missing: list[str] = []
     for ticket_id, ticket_path in requested_tickets:
         records = candidates.get(ticket_id, [])
-        if len(records) > 1 and ticket_path is not None:
+        if ticket_path is not None:
             records = [
                 record
                 for record in records
