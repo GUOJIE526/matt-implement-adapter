@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement Small Change"
+  short_description: "Safely handle small fixes with proportional validation"
+  default_prompt: "Use $implement-small-change to make this narrow change safely and escalate hidden scope before editing."
