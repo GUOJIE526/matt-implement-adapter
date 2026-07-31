@@ -1,6 +1,6 @@
 ---
 name: implement-ticket-batch
-description: Adapt Matt's implement workflow to Codex when one request contains more than one approved implementation ticket. Run one fresh subagent per ticket in an isolated Git worktree and branch, run independent unblocked tickets in parallel, integrate completed branches in dependency order, handle conflicts and shared test resources in the parent, require each ticket to complete its own TDD, tests, code review, fixes, and commit, and clean up integrated worktrees and branches. Apply implicitly from the task shape; do not require a trigger phrase. Do not use for a single ticket or for unresolved Wayfinder decision tickets.
+description: Adapt Matt's implement workflow to Codex when one request contains more than one approved implementation ticket. Run one fresh subagent per ticket in an isolated Git worktree and branch, let each worker follow the installed Matt implement skill, run independent unblocked tickets in parallel, integrate completed branches in dependency order, handle conflicts and shared test resources in the parent, and clean up integrated worktrees and branches. Apply implicitly from the task shape; do not require a trigger phrase. Do not use for a single ticket or for unresolved Wayfinder decision tickets.
 ---
 
 # Matt Implement Ticket Batch
@@ -17,38 +17,6 @@ each ticket worker owns the complete Matt workflow for exactly one ticket.
 - Use the configured tracker to read the parent spec, ticket bodies, statuses, blockers, and linked decisions.
 - Honor explicit handoff or stop boundaries.
 - Use the ordinary Matt `implement` workflow in the current context when there is only one ticket.
-
-## Worker-owned optional implementation briefs
-
-The parent does not discover, read, attach, inline, or mention implementation brief paths when it
-constructs a worker prompt. The parent prompt contains only the ticket, worker worktree, parent
-spec, repository instructions, and boundary information required to perform the ticket.
-
-After the worker worktree is created, the worker resolves `<this-skill-directory>` from the directory
-containing this loaded `SKILL.md`, then discovers optional briefs from inside that worktree:
-
-```powershell
-$skillDirectory = "<this-skill-directory>"
-$wrapper = Join-Path $skillDirectory "..\..\scripts\discover_worker_brief.ps1"
-if (-not (Test-Path -LiteralPath $wrapper -PathType Leaf)) {
-  Write-Warning "Optional worker brief wrapper not found; continuing without a brief: $wrapper"
-} else {
-  & $wrapper `
-    -Repo "<worker-worktree>" `
-    -Ticket "<ticket-reference>"
-}
-```
-
-Treat only `matched` entries as available guidance. The worker reads a matched brief from its own
-worktree and keeps the brief body in the worker context. Missing, draft, stale-looking, malformed,
-ambiguous, or failed discovery is optional and must not stop implementation. Do not use `@brief-path`,
-file attachments, or parent-generated brief summaries.
-
-The wrapper resolves `implementation_brief.py` from its own `$PSScriptRoot`. Do not depend on
-`$env:PLUGIN_ROOT` or put a host-specific absolute path in repository files or prompt templates.
-
-Briefs are implementation guidance, not a replacement for the parent spec, ticket, repository
-instructions, or installed Matt skills. Do not read or pass one ticket's brief to another worker.
 
 ## Establish isolated ticket worktrees
 
@@ -91,33 +59,13 @@ Spawn exactly one fresh subagent with no inherited conversation turns for each f
 - any shared test-resource lock, isolated database/schema, port, temporary directory, or generated-output
   directory it must use.
 
-The worker prompt must not contain a brief body, brief attachment, or `@brief-path` reference. Tell the
-worker to run the worker-local discovery command above before coding.
+Tell the worker to invoke the installed Matt `implement` skill for that ticket only. The installed skill
+is authoritative; do not restate its workflow in the worker prompt or add adapter-owned implementation
+steps.
 
-Tell the worker to invoke the installed Matt `implement` skill for that ticket only. It owns the complete
-per-ticket workflow:
-
-1. Work through Matt `tdd` at the agreed seams.
-2. Run focused tests and type checks regularly, then the full project test suite once at the ticket end
-   as Matt `implement` requires. If a suite uses a non-isolated shared resource, the parent must serialize
-   that resource-dependent phase or provide an isolated resource; the worker must not silently skip it.
-3. Keep all edits inside its worker worktree and ticket scope. Do not edit the main worktree or another
-   worker's branch.
-4. Create a provisional ticket commit so the installed Matt `code-review` can inspect
-   `<ticket-start>...HEAD`.
-5. Run the ticket's own two-axis Matt `code-review`; do not defer it to the parent and do not replace it
-   with an aggregate batch review.
-6. Fix every accepted finding, revalidate, and amend the same ticket commit.
-7. Run the boundary finish check and return the final commit SHA, changed files, test results, review
-   results, worktree path, branch, and unresolved risks.
-
-If the worker discovers an optional implementation brief for this ticket, require it to read the brief
-from the worker worktree before coding. Treat the brief as design guidance only; if it conflicts with
-the ticket, parent spec, repository instructions, or installed skills, follow the authoritative source
-and report the conflict.
-
-The provisional-commit bridge is required because the installed Matt `code-review` reads committed `HEAD`
-history while `implement` otherwise asks for review before the final commit.
+Keep all worker edits inside its worker worktree and ticket scope. After the installed Matt workflow
+finishes, run the boundary finish check and return the final commit SHA, changed files, workflow results,
+worktree path, branch, and unresolved risks.
 
 ## Integrate in dependency order
 
@@ -184,7 +132,7 @@ python "<this-skill-directory>\scripts\ticket_boundary.py" finish --state "<stat
 ```
 
 Only continue when the worker boundary succeeds, exactly one commit was added, its worktree is clean, and
-the worker completed its own review and validation. After successful integration and required checks, run:
+the installed Matt workflow completed successfully. After successful integration and required checks, run:
 
 ```powershell
 python "<this-skill-directory>\scripts\ticket_boundary.py" cleanup --state "<state-path>"

@@ -21,22 +21,9 @@ context，容易造成 ticket 之間的需求與修改互相混淆，也不容�
 - 每張 ticket 使用一個全新、隔離 worktree 與 branch 的 subagent context。
 - 同一個未阻塞 dependency frontier 中，彼此獨立的 ticket 可以並行執行。
 - 每張 ticket 自己完成 TDD、測試、雙軸 code review、修正與單一 commit。
-- 若目標 repository 提供 optional `implementation-briefs`，worker 會在自己的 worker worktree 內搜尋並讀取對應 brief；找不到時不會阻擋原本流程。
 - 主 agent 依 ticket dependency order 將完成的 branch merge 或 cherry-pick 回主線。
 - 主 agent 處理 merge conflict、共用測試資源與整合測試，最後移除已整合的 worktree 與 branch。
 - 單張 ticket 與尚未完成 Wayfinder 決策的 ticket 不套用 adapter。
-
-### Optional Implementation Briefs
-
-目標 repository 可以將 ticket 的實作設計輔助文件放在：
-
-```text
-.scratch/<feature-slug>/implementation-briefs/
-```
-
-Brief discovery 由 worker 在自己的 worktree 內執行，adapter 會從已載入的 batch skill 位置解析
-所需工具。Brief 只作為實作參考；找不到合適內容或 discovery 失敗時，不會阻擋正常 implement
-流程。
 
 ## 安裝需求
 

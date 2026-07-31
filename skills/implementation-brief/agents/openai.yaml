@@ -1,4 +1,0 @@
-interface:
-  display_name: "Implementation Brief"
-  short_description: "Expose hidden logic before implementation"
-  default_prompt: "Use $implementation-brief to classify this ticket and prepare the smallest useful implementation brief before coding."
