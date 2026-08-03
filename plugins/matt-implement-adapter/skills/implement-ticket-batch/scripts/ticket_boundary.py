@@ -4,16 +4,70 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Iterator, Literal, TypedDict, cast
 
 
 STATE_SCHEMA_VERSION = 2
+BATCH_PLAN_SCHEMA_VERSION = 1
+BATCH_PLAN_KIND = "matt-implement-batch-plan"
+TICKET_STATUSES = frozenset(
+    {
+        "planned",
+        "runnable",
+        "started",
+        "finished",
+        "integrated",
+        "cleaned",
+        "integration_conflict",
+        "failed",
+        "orphaned",
+    }
+)
+RUNNABLE_STATUSES = frozenset({"planned", "runnable"})
+TicketStatus = Literal[
+    "planned",
+    "runnable",
+    "started",
+    "finished",
+    "integrated",
+    "cleaned",
+    "integration_conflict",
+    "failed",
+    "orphaned",
+]
+
+
+class BatchTicketRecord(TypedDict):
+    ticket: str
+    dependencies: list[str]
+    direct_dependencies: list[str]
+    required_checks: list[str]
+    status: TicketStatus
+
+
+class BatchPlanError(RuntimeError):
+    """A fail-closed, machine-readable batch plan/state error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "invalid_batch_plan",
+        details: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.details = details or {}
 
 
 def run_git_process(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -50,6 +104,468 @@ def require_clean(repo: Path) -> None:
 
 def write_state(state_path: Path, state: dict[str, object]) -> None:
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+@contextmanager
+def batch_state_lock(state_path: Path) -> Iterator[None]:
+    """Serialize batch-state readers/writers with an OS-level file lock."""
+
+    lock_path = state_path.with_name(f"{state_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        if lock_file.tell() == 0:
+            lock_file.write(b"0")
+            lock_file.flush()
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write_json(path: Path, document: dict[str, object]) -> None:
+    """Replace a JSON state atomically, cleaning up failed temporary writes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(document, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def write_batch_state(state_path: Path, state: dict[str, object]) -> None:
+    validate_batch_plan(state)
+    with batch_state_lock(state_path):
+        _atomic_write_json(state_path, state)
+
+
+def _load_batch_state_unlocked(state_path: Path) -> dict[str, object]:
+    if not state_path.exists():
+        raise BatchPlanError(
+            f"batch state does not exist: {state_path}",
+            error_code="batch_state_missing",
+        )
+    try:
+        document = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BatchPlanError(
+            f"batch state is corrupted: {state_path}",
+            error_code="batch_state_corrupt",
+            details={"reason": str(error)},
+        ) from error
+    if not isinstance(document, dict):
+        raise BatchPlanError(
+            "batch state root must be a JSON object", error_code="batch_state_corrupt"
+        )
+    validate_batch_plan(document)
+    return document
+
+
+def load_batch_state(state_arg: str) -> tuple[Path, dict[str, object]]:
+    state_path = Path(state_arg).expanduser().resolve()
+    if not state_path.exists():
+        raise BatchPlanError(
+            f"batch state does not exist: {state_path}",
+            error_code="batch_state_missing",
+        )
+    with batch_state_lock(state_path):
+        state = _load_batch_state_unlocked(state_path)
+    return state_path, state
+
+
+def _ticket_identity(record: object) -> str:
+    if isinstance(record, str):
+        identity = record
+    elif isinstance(record, dict):
+        identity = record.get("ticket", record.get("ticket_id", record.get("id", "")))
+    else:
+        identity = ""
+    if not isinstance(identity, str) or not identity.strip():
+        raise BatchPlanError("ticket identity must be a non-empty string")
+    return identity.strip()
+
+
+def _string_list(value: object, field: str, ticket: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise BatchPlanError(
+            f"{field} for ticket {ticket!r} must be a list of strings",
+            details={"ticket": ticket, "field": field},
+        )
+    values = [item.strip() for item in value]
+    if any(not item for item in values):
+        raise BatchPlanError(
+            f"{field} for ticket {ticket!r} contains an empty value",
+            details={"ticket": ticket, "field": field},
+        )
+    if len(values) != len(set(values)):
+        raise BatchPlanError(
+            f"{field} for ticket {ticket!r} contains duplicates",
+            details={"ticket": ticket, "field": field},
+        )
+    return values
+
+
+def normalize_ticket_records(records: object) -> list[BatchTicketRecord]:
+    if isinstance(records, dict) and "tickets" in records:
+        ticket_values = records["tickets"]
+        dependency_map = records.get("dependencies", records.get("direct_dependencies", {}))
+        checks_map = records.get("required_checks", {})
+        if not isinstance(dependency_map, dict) or not isinstance(checks_map, dict):
+            raise BatchPlanError(
+                "batch plan dependency and required-check maps must be JSON objects"
+            )
+        if isinstance(ticket_values, list):
+            expanded: list[object] = []
+            for value in ticket_values:
+                ticket = _ticket_identity(value)
+                if isinstance(value, dict):
+                    item = dict(value)
+                    item.setdefault("dependencies", dependency_map.get(ticket, []))
+                    item.setdefault("required_checks", checks_map.get(ticket, []))
+                else:
+                    item = {
+                        "ticket": ticket,
+                        "dependencies": dependency_map.get(ticket, []),
+                        "required_checks": checks_map.get(ticket, []),
+                    }
+                expanded.append(item)
+            records = expanded
+    if isinstance(records, dict):
+        records = [
+            {"ticket": ticket, "dependencies": dependencies}
+            for ticket, dependencies in records.items()
+        ]
+    if not isinstance(records, list) or not records:
+        raise BatchPlanError("tickets must be a non-empty JSON list")
+    normalized: list[BatchTicketRecord] = []
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for raw in records:
+        ticket = _ticket_identity(raw)
+        if ticket in seen:
+            duplicates.append(ticket)
+            continue
+        seen.add(ticket)
+        if isinstance(raw, dict):
+            dependencies = raw.get("dependencies", raw.get("direct_dependencies", []))
+            required_checks = raw.get("required_checks", [])
+            status = raw.get("status", "planned")
+        else:
+            dependencies = []
+            required_checks = []
+            status = "planned"
+        if not isinstance(status, str) or status not in TICKET_STATUSES:
+            raise BatchPlanError(
+                f"unsupported status for ticket {ticket!r}",
+                details={"ticket": ticket, "status": status},
+            )
+        normalized_dependencies = _string_list(dependencies, "dependencies", ticket)
+        normalized_checks = _string_list(required_checks, "required_checks", ticket)
+        item: BatchTicketRecord = {
+            "ticket": ticket,
+            "dependencies": normalized_dependencies,
+            "direct_dependencies": normalized_dependencies.copy(),
+            "required_checks": normalized_checks,
+            "status": cast(TicketStatus, status),
+        }
+        normalized.append(item)
+    if duplicates:
+        raise BatchPlanError(
+            "duplicate ticket identities are not allowed",
+            details={"duplicates": sorted(set(duplicates))},
+        )
+    return normalized
+
+
+def _validate_dependency_graph(records: list[BatchTicketRecord]) -> None:
+    identifiers = [str(record["ticket"]) for record in records]
+    known = set(identifiers)
+    unknown: dict[str, list[str]] = {}
+    self_dependencies: dict[str, list[str]] = {}
+    graph: dict[str, list[str]] = {}
+    for record in records:
+        ticket = str(record["ticket"])
+        dependencies = [str(item) for item in record["dependencies"]]
+        graph[ticket] = dependencies
+        missing = [dependency for dependency in dependencies if dependency not in known]
+        if missing:
+            unknown[ticket] = missing
+        own = [dependency for dependency in dependencies if dependency == ticket]
+        if own:
+            self_dependencies[ticket] = own
+    if unknown:
+        raise BatchPlanError(
+            "dependency references an unknown ticket",
+            details={"unknown_dependencies": unknown},
+        )
+    if self_dependencies:
+        raise BatchPlanError(
+            "a ticket cannot depend on itself",
+            details={"self_dependencies": self_dependencies},
+        )
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    path: list[str] = []
+
+    def visit(ticket: str) -> None:
+        if ticket in visiting:
+            cycle_start = path.index(ticket)
+            cycle = path[cycle_start:] + [ticket]
+            raise BatchPlanError(
+                "dependency graph contains a cycle", details={"cycle": cycle}
+            )
+        if ticket in visited:
+            return
+        visiting.add(ticket)
+        path.append(ticket)
+        for dependency in graph[ticket]:
+            visit(dependency)
+        path.pop()
+        visiting.remove(ticket)
+        visited.add(ticket)
+
+    for ticket in identifiers:
+        visit(ticket)
+
+
+def _require_batch_size(records: list[BatchTicketRecord]) -> None:
+    if len(records) < 2:
+        raise BatchPlanError(
+            "batch plan requires at least two implementation tickets",
+            error_code="single_ticket_batch",
+        )
+
+
+def validate_batch_plan(state: dict[str, object]) -> None:
+    if state.get("schema_version") != BATCH_PLAN_SCHEMA_VERSION:
+        raise BatchPlanError(
+            "batch plan schema version is unsupported",
+            error_code="batch_state_unsupported_schema",
+            details={"schema_version": state.get("schema_version")},
+        )
+    if state.get("kind") != BATCH_PLAN_KIND:
+        raise BatchPlanError("state is not a batch plan", error_code="batch_state_corrupt")
+    for field in ("repo", "target_branch", "starting_sha", "tickets", "required_checks"):
+        if field not in state:
+            raise BatchPlanError(
+                f"batch plan is missing required field: {field}",
+                error_code="batch_state_corrupt",
+            )
+    if not isinstance(state["target_branch"], str) or not state["target_branch"]:
+        raise BatchPlanError("target_branch must be a non-empty string")
+    if not isinstance(state["starting_sha"], str) or not state["starting_sha"]:
+        raise BatchPlanError("starting_sha must be a non-empty string")
+    records = normalize_ticket_records(state["tickets"])
+    _validate_dependency_graph(records)
+    _require_batch_size(records)
+    state["tickets"] = records
+    identities = {str(record["ticket"]) for record in records}
+    checks = state["required_checks"]
+    if not isinstance(checks, dict) or set(checks) != identities:
+        raise BatchPlanError(
+            "required_checks must map every ticket identity exactly once",
+            error_code="batch_state_corrupt",
+        )
+    for ticket, values in checks.items():
+        _string_list(values, "required_checks", str(ticket))
+    if "frontier" in state and (
+        not isinstance(state["frontier"], list)
+        or any(not isinstance(ticket, str) or ticket not in identities for ticket in state["frontier"])
+    ):
+        raise BatchPlanError(
+            "persisted frontier contains an unknown or invalid ticket",
+            error_code="batch_state_corrupt",
+        )
+
+
+def calculate_frontier(state: dict[str, object]) -> dict[str, object]:
+    """Return the current runnable frontier without mutating the persisted plan."""
+
+    validate_batch_plan(state)
+    return _calculate_frontier(state)
+
+
+def _calculate_frontier(state: dict[str, object]) -> dict[str, object]:
+    """Calculate a frontier for a plan that has already passed validation."""
+
+    tickets = [dict(record) for record in state["tickets"]]
+    frontier: list[str] = []
+    blocked: dict[str, dict[str, object]] = {}
+    for record in tickets:
+        ticket = str(record["ticket"])
+        status = str(record["status"])
+        dependencies = [str(item) for item in record["dependencies"]]
+        if status not in RUNNABLE_STATUSES:
+            blocked[ticket] = {
+                "predecessors": [],
+                "gates": [],
+                "status": status,
+                "reason": "ticket is already in progress or complete",
+            }
+            continue
+        if dependencies:
+            blocked[ticket] = {
+                "predecessors": dependencies,
+                "gates": [],
+                "status": status,
+                "reason": "ticket has declared predecessors",
+            }
+        else:
+            frontier.append(ticket)
+    return {
+        "verified": True,
+        "schema_version": state["schema_version"],
+        "kind": state["kind"],
+        "state_path": state.get("state_path"),
+        "batch_id": state.get("batch_id"),
+        "repo": state.get("repo"),
+        "target_branch": state["target_branch"],
+        "starting_sha": state["starting_sha"],
+        "tickets": tickets,
+        "dependencies": {
+            str(record["ticket"]): list(record["dependencies"]) for record in tickets
+        },
+        "required_checks": state.get("required_checks", {}),
+        "frontier": frontier,
+        "runnable": frontier,
+        "blocked": blocked,
+    }
+
+
+def _read_tickets_argument(value: str) -> object:
+    candidate = Path(value).expanduser()
+    if candidate.exists():
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise BatchPlanError(
+                f"tickets file is not valid JSON: {candidate}",
+                details={"reason": str(error)},
+            ) from error
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as error:
+        raise BatchPlanError(
+            "tickets must be inline JSON or a path to a JSON file",
+            details={"reason": str(error)},
+        ) from error
+
+
+def create_batch_plan(
+    repo_arg: str,
+    state_arg: str,
+    *,
+    target_branch: str | None = None,
+    starting_sha: str | None = None,
+    tickets: object,
+) -> dict[str, object]:
+    main_repo = resolve_repo(repo_arg)
+    require_clean(main_repo)
+    branch = target_branch or run_git(main_repo, "branch", "--show-current")
+    if not branch:
+        raise BatchPlanError("detached HEAD is not supported for a batch plan")
+    if (
+        run_git_process(main_repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode
+        != 0
+    ):
+        raise BatchPlanError(
+            f"target branch does not exist: {branch}",
+            error_code="batch_target_invalid",
+        )
+    target_head = run_git(main_repo, "rev-parse", f"refs/heads/{branch}")
+    requested_start = starting_sha or target_head
+    try:
+        resolved_start = run_git(main_repo, "rev-parse", "--verify", f"{requested_start}^{{commit}}")
+    except RuntimeError as error:
+        raise BatchPlanError(
+            f"starting SHA is not a commit: {requested_start}",
+            error_code="batch_start_invalid",
+        ) from error
+    if resolved_start != target_head:
+        raise BatchPlanError(
+            "starting SHA must equal the target branch HEAD",
+            error_code="batch_target_stale",
+            details={"target_head": target_head, "starting_sha": resolved_start},
+        )
+
+    records = normalize_ticket_records(tickets)
+    _validate_dependency_graph(records)
+    _require_batch_size(records)
+    state_path = Path(state_arg).expanduser().resolve()
+    required_checks = {
+        str(record["ticket"]): list(record["required_checks"]) for record in records
+    }
+    identity = json.dumps(
+        {"repo": str(main_repo), "branch": branch, "sha": resolved_start, "tickets": records},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    plan: dict[str, object] = {
+        "schema_version": BATCH_PLAN_SCHEMA_VERSION,
+        "kind": BATCH_PLAN_KIND,
+        "batch_id": hashlib.sha256(identity).hexdigest()[:24],
+        "repo": str(main_repo),
+        "state_path": str(state_path),
+        "target_branch": branch,
+        "starting_sha": resolved_start,
+        "tickets": records,
+        "dependencies": {
+            str(record["ticket"]): list(record["dependencies"]) for record in records
+        },
+        "required_checks": required_checks,
+        "frontier_generation": 0,
+    }
+    initial_frontier = _calculate_frontier(plan)
+    plan["frontier"] = list(initial_frontier["frontier"])
+    plan["runnable"] = list(initial_frontier["runnable"])
+    with batch_state_lock(state_path):
+        if state_path.exists():
+            raise BatchPlanError(
+                f"batch state already exists: {state_path}", error_code="batch_state_exists"
+            )
+        _atomic_write_json(state_path, plan)
+    return initial_frontier
+
+
+def query_batch_frontier(state_arg: str) -> dict[str, object]:
+    state_path, state = load_batch_state(state_arg)
+    state["state_path"] = str(state_path)
+    return calculate_frontier(state)
 
 
 def load_state(state_arg: str) -> tuple[Path, dict[str, object]]:
@@ -323,9 +839,33 @@ def cleanup_boundary(state_arg: str) -> dict[str, object]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Create, verify, integrate, and clean up one ticket's Git worktree."
+        description=(
+            "Create and query a validated batch plan, or create, verify, integrate, "
+            "and clean up one ticket's Git worktree."
+        )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    plan_parser = subparsers.add_parser(
+        "plan", aliases=("batch-plan",), help="create or query a persisted batch plan"
+    )
+    plan_subparsers = plan_parser.add_subparsers(dest="plan_command", required=True)
+
+    plan_create_parser = plan_subparsers.add_parser(
+        "create", help="validate and persist a batch plan before any worker starts"
+    )
+    plan_create_parser.add_argument("--repo", required=True)
+    plan_create_parser.add_argument("--state", required=True)
+    plan_create_parser.add_argument("--target-branch", "--target", dest="target_branch")
+    plan_create_parser.add_argument("--starting-sha", "--start-sha", dest="starting_sha")
+    plan_create_parser.add_argument(
+        "--tickets-json", "--tickets-file", "--tickets", dest="tickets", required=True
+    )
+
+    plan_frontier_parser = plan_subparsers.add_parser(
+        "frontier", aliases=("query", "show", "load"), help="query the current runnable frontier"
+    )
+    plan_frontier_parser.add_argument("--state", required=True)
 
     start_parser = subparsers.add_parser("start")
     start_parser.add_argument("--repo", required=True)
@@ -349,7 +889,18 @@ def main() -> int:
 
     args = parser.parse_args()
     try:
-        if args.command == "start":
+        if args.command in {"plan", "batch-plan"}:
+            if args.plan_command == "create":
+                result = create_batch_plan(
+                    args.repo,
+                    args.state,
+                    target_branch=args.target_branch,
+                    starting_sha=args.starting_sha,
+                    tickets=_read_tickets_argument(args.tickets),
+                )
+            else:
+                result = query_batch_frontier(args.state)
+        elif args.command == "start":
             result = start_boundary(
                 args.repo,
                 args.ticket,
@@ -367,6 +918,19 @@ def main() -> int:
             )
         else:
             result = cleanup_boundary(args.state)
+    except BatchPlanError as error:
+        print(
+            json.dumps(
+                {
+                    "verified": False,
+                    "error": str(error),
+                    "error_code": error.error_code,
+                    "details": error.details,
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 1
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(json.dumps({"verified": False, "error": str(error)}), file=sys.stderr)
         return 1
