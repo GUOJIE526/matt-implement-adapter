@@ -1,6 +1,6 @@
 ---
 name: implement-ticket-batch
-description: Adapt Matt's implement workflow to Codex when one request contains more than one approved implementation ticket. Run one fresh subagent per ticket in an isolated Git worktree and branch, let each worker follow the installed Matt implement skill, run independent unblocked tickets in parallel, integrate completed branches in dependency order, handle conflicts and shared test resources in the parent, and clean up integrated worktrees and branches. Apply implicitly from the task shape; do not require a trigger phrase. Do not use for a single ticket or for unresolved Wayfinder decision tickets.
+description: Adapt Matt's implement workflow to Codex when one request contains more than one approved implementation ticket. Adapter activation does not imply concurrency: run one fresh subagent per ticket in an isolated Git worktree and branch, let each worker follow the installed Matt implement skill, and run independent tickets in parallel only within the same validated, unblocked scheduler frontier. Integrate completed branches in dependency order, handle conflicts and shared test resources in the parent, and clean up integrated worktrees and branches. Apply implicitly from the task shape; do not require a trigger phrase. Do not use for a single ticket or for unresolved Wayfinder decision tickets.
 ---
 
 # Matt Implement Ticket Batch
@@ -12,6 +12,9 @@ each ticket worker owns the complete Matt workflow for exactly one ticket.
 ## Qualify the batch
 
 - Require more than one approved implementation ticket.
+- Adapter activation does not imply concurrency. Qualification decides whether the adapter is used;
+  the scheduler decides which tickets can start together.
+- Work only the open, unblocked frontier returned by the scheduler; never widen it from conversation order.
 - Do not treat Wayfinder decision tickets as implementation tickets. Finish the Wayfinder → to-spec →
   to-tickets handoff first.
 - Use the configured tracker to read the parent spec, ticket bodies, statuses, blockers, and linked decisions.
@@ -26,10 +29,12 @@ each ticket worker owns the complete Matt workflow for exactly one ticket.
 3. Freeze the current target branch and starting SHA before opening the frontier. Do not integrate into
    that branch while the initial frontier worktrees are being created.
    Persist a validated batch plan with `plan create` before invoking any worker start, and pass its state
-   path to each start command.
-4. Order tickets by their blocking graph and work only the open, unblocked frontier. Independent tickets
-   in the same frontier may run in parallel; a dependent ticket waits until its predecessors are integrated
-   and the required checks pass.
+   path to each start command. A batch plan is required even when its dependency graph is a single linear
+   chain.
+4. Order tickets by their blocking graph and work only the open, unblocked scheduler frontier. Query
+   `plan frontier` or `status` after each lifecycle transition; start only the tickets it returns. Independent
+   tickets in the same validated frontier may run in parallel; a dependent ticket waits until its predecessors
+   are integrated and the required checks pass. Adapter activation alone never authorizes a parallel start.
 5. Create one worktree and worker branch per frontier ticket with:
 
    ```powershell
@@ -43,7 +48,7 @@ each ticket worker owns the complete Matt workflow for exactly one ticket.
    `worktree`, `branch`, and `start_sha`. Never give two workers the same worktree or branch.
 
 6. Keep at most one worker per ticket, but allow one fresh worker for every ticket in the current
-   unblocked frontier to be active at the same time.
+   scheduler-approved unblocked frontier to be active at the same time.
 
 The worktree directory name is exactly the bounded `ticket_slug(ticket)`. Do not append UUIDs,
 branch names, or other suffixes to the worktree path; the worker branch retains its unique token so
@@ -99,6 +104,18 @@ python "<this-skill-directory>\scripts\ticket_boundary.py" verify `
 
 Use `--result failed` when a required check fails. Even a ticket with no extra checks must record an explicit
 `passed` result; an absent verification result keeps all dependents blocked.
+
+Use the status and report commands to make the lifecycle auditable:
+
+```powershell
+python "<this-skill-directory>\scripts\ticket_boundary.py" status --state "<batch-state>"
+python "<this-skill-directory>\scripts\ticket_boundary.py" report --state "<batch-state>"
+```
+
+Status shows the current scheduler frontier, every ticket state, unmet predecessors, and verification gates.
+The completion report orders tickets by dependency and includes worker branch, start SHA, integrated commit,
+verification result, and live worktree/branch evidence. It must not claim completion for unfinished, failed,
+conflicted, or orphaned work.
 
 ### Handle merge conflicts
 
@@ -163,3 +180,12 @@ worktrees or `codex/matt-ticket/*` branches remain, required broad runtime/E2E e
 tracker statuses are updated, and the target worktree is clean. Do not run an aggregate Matt `code-review`;
 each ticket already completed the official workflow in its own context. Report any blocked ticket without
 bypassing its blockers.
+
+### Upgrade and legacy recovery
+
+The batch state is the scheduler's durable source of truth and is required before every multi-ticket start.
+When resuming a task after compaction or upgrading the adapter, load the persisted state and query its
+frontier/status instead of reconstructing progress from conversation memory. Existing pre-batch worker states
+remain safely recoverable through `plan import`/`legacy import`; validate their repository, target branch,
+ticket identity, integration ancestry, and explicit verification before they can unlock a new dependent. Do not
+release or upgrade the marketplace as part of a ticket implementation.

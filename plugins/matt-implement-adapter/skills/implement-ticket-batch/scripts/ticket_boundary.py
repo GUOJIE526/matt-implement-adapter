@@ -1116,6 +1116,382 @@ def query_batch_frontier(state_arg: str) -> dict[str, object]:
     return calculate_frontier(state)
 
 
+def _dependency_order(state: dict[str, object]) -> list[str]:
+    """Return ticket identities in deterministic dependency order."""
+
+    records = [
+        cast(BatchTicketRecord, record)
+        for record in state.get("tickets", [])
+        if isinstance(record, dict)
+    ]
+    identities = [str(record["ticket"]) for record in records]
+    position = {ticket: index for index, ticket in enumerate(identities)}
+    dependencies = {
+        str(record["ticket"]): [str(item) for item in record["dependencies"]]
+        for record in records
+    }
+    remaining = set(identities)
+    ordered: list[str] = []
+    while remaining:
+        ready = [
+            ticket
+            for ticket in identities
+            if ticket in remaining
+            and all(dependency not in remaining for dependency in dependencies[ticket])
+        ]
+        if not ready:
+            # ``validate_batch_plan`` already rejects cycles. Keep this helper
+            # fail-closed if it is called with an unvalidated in-memory state.
+            raise BatchPlanError(
+                "dependency graph contains a cycle",
+                details={"remaining": sorted(remaining)},
+            )
+        for ticket in sorted(ready, key=position.__getitem__):
+            ordered.append(ticket)
+            remaining.remove(ticket)
+    return ordered
+
+
+def _ticket_state_record(
+    state: dict[str, object], ticket: str
+) -> dict[str, object] | None:
+    ticket_states = state.get("ticket_states")
+    if not isinstance(ticket_states, dict):
+        return None
+    value = ticket_states.get(ticket)
+    return value if isinstance(value, dict) else None
+
+
+def _git_branch_exists(repo: Path, branch: str | None) -> bool | None:
+    if not isinstance(branch, str) or not branch:
+        return None
+    return (
+        run_git_process(
+            repo,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        ).returncode
+        == 0
+    )
+
+
+def _registered_worktree_paths(repo: Path) -> set[Path]:
+    result = run_git_process(repo, "worktree", "list", "--porcelain")
+    if result.returncode != 0:
+        return set()
+    paths: set[Path] = set()
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            paths.add(Path(line[len("worktree ") :]).expanduser().resolve())
+    return paths
+
+
+def _worktree_registered(repo: Path, worktree: str | None) -> bool | None:
+    if not isinstance(worktree, str) or not worktree:
+        return None
+    return Path(worktree).expanduser().resolve() in _registered_worktree_paths(repo)
+
+
+def _verification_result(
+    record: BatchTicketRecord, state: dict[str, object]
+) -> str | None:
+    verification = _ticket_verification(record, state)
+    if verification is None:
+        return None
+    value = verification.get("result", verification.get("status"))
+    return str(value) if value is not None else None
+
+
+def _audit_ticket(
+    state: dict[str, object],
+    frontier: dict[str, object],
+    record: BatchTicketRecord,
+    *,
+    target_drift: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Project persisted lifecycle evidence and live Git artifacts for reports."""
+
+    ticket = str(record["ticket"])
+    lifecycle_status = str(record["status"])
+    ticket_state = _ticket_state_record(state, ticket)
+    integration = _ticket_integration(record, state)
+    verification = _ticket_verification(record, state)
+    worker_branch = (
+        ticket_state.get("branch") if ticket_state is not None else None
+    )
+    worktree = ticket_state.get("worktree") if ticket_state is not None else None
+    start_sha = (
+        ticket_state.get("start_sha", ticket_state.get("verified_start_sha"))
+        if ticket_state is not None
+        else None
+    )
+    final_sha = ticket_state.get("final_sha") if ticket_state is not None else None
+    integrated_commit = _integration_commit(integration)
+    verification_result = _verification_result(record, state)
+
+    branch_exists: bool | None = None
+    worktree_registered: bool | None = None
+    worktree_exists: bool | None = None
+    orphan_reasons: list[str] = []
+    repo_value = state.get("repo")
+    repository = Path(str(repo_value)).expanduser().resolve() if repo_value else None
+    if repository is not None and worker_branch is not None:
+        branch_exists = _git_branch_exists(repository, str(worker_branch))
+    if repository is not None and worktree is not None:
+        worktree_registered = _worktree_registered(repository, str(worktree))
+        worktree_exists = Path(str(worktree)).expanduser().resolve().exists()
+
+    # A started/finished/integrating/integration-conflict worker owns both
+    # artifacts until cleanup. Missing either side means the evidence can no
+    # longer be resumed safely. A cleaned worker owns neither artifact.
+    expected_active = lifecycle_status in {
+        "started",
+        "finished",
+        "integrating",
+        "integration_conflict",
+        "failed",
+        "integrated",
+    }
+    if expected_active:
+        if not isinstance(worker_branch, str) or not worker_branch:
+            orphan_reasons.append("worker_branch_missing")
+        elif branch_exists is False:
+            orphan_reasons.append("worker_branch_missing")
+        if not isinstance(worktree, str) or not worktree:
+            orphan_reasons.append("worktree_missing")
+        elif worktree_registered is False or worktree_exists is False:
+            orphan_reasons.append("worktree_missing")
+    elif lifecycle_status == "cleaned":
+        if branch_exists is True:
+            orphan_reasons.append("worker_branch_present_after_cleanup")
+        if worktree_registered is True or worktree_exists is True:
+            orphan_reasons.append("worktree_present_after_cleanup")
+
+    blocked = frontier.get("blocked", {})
+    blocked_details = blocked.get(ticket, {}) if isinstance(blocked, dict) else {}
+    if not isinstance(blocked_details, dict):
+        blocked_details = {}
+    unmet_predecessors = list(blocked_details.get("predecessors", []))
+    verification_gates = list(blocked_details.get("gates", []))
+    if lifecycle_status in {"failed", "integration_conflict"}:
+        verification_gates.append(f"status:{lifecycle_status}")
+    if lifecycle_status in {"integrated", "cleaned"}:
+        if verification_result is None:
+            verification_gates.append("verification:missing")
+        elif verification_result != "passed":
+            verification_gates.append(f"verification:{verification_result}")
+    if target_drift is not None:
+        verification_gates.append("target:stale")
+    # Preserve order while removing duplicate gate labels produced by the
+    # dependency projection and lifecycle checks.
+    verification_gates = list(dict.fromkeys(str(gate) for gate in verification_gates))
+
+    observed_status = "orphaned" if orphan_reasons else lifecycle_status
+    return {
+        "ticket": ticket,
+        "dependencies": list(record["dependencies"]),
+        "required_checks": list(record["required_checks"]),
+        "status": observed_status,
+        "persisted_status": lifecycle_status,
+        "unmet_predecessors": [str(item) for item in unmet_predecessors],
+        "verification_gates": verification_gates,
+        "gates": verification_gates,
+        "worker_branch": worker_branch,
+        "start_sha": start_sha,
+        "final_sha": final_sha,
+        "integrated_commit": integrated_commit,
+        "verification_result": verification_result,
+        "verification": verification,
+        "worktree": worktree,
+        "branch_exists": branch_exists,
+        "worktree_registered": worktree_registered,
+        "worktree_exists": worktree_exists,
+        "orphan_reasons": orphan_reasons,
+        "target_drift": target_drift,
+        "reason": blocked_details.get("reason"),
+    }
+
+
+def _current_target_head(state: dict[str, object]) -> str | None:
+    repo_value = state.get("repo")
+    target_branch = state.get("target_branch")
+    if not isinstance(repo_value, str) or not isinstance(target_branch, str):
+        return None
+    try:
+        return run_git(Path(repo_value).expanduser().resolve(), "rev-parse", target_branch)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _report_completion(
+    entries: list[dict[str, object]],
+    *,
+    target_drift: dict[str, object] | None = None,
+) -> tuple[bool, list[str]]:
+    incomplete: list[str] = []
+    for entry in entries:
+        status = str(entry["status"])
+        ticket = str(entry["ticket"])
+        if status not in SATISFIED_PREDECESSOR_STATUSES:
+            incomplete.append(ticket)
+            continue
+        if entry.get("verification_result") != "passed":
+            incomplete.append(ticket)
+            continue
+        if entry.get("orphan_reasons"):
+            incomplete.append(ticket)
+    if target_drift is not None:
+        incomplete.extend(
+            str(entry["ticket"])
+            for entry in entries
+            if str(entry["ticket"]) not in incomplete
+        )
+    return not incomplete, incomplete
+
+
+def _target_drift(
+    state: dict[str, object], live_target_head: str | None
+) -> dict[str, object] | None:
+    expected = str(state.get("frontier_sha", state.get("starting_sha", "")))
+    if live_target_head is None:
+        return {
+            "reason": "target branch HEAD could not be read",
+            "expected_head": expected,
+            "actual_head": None,
+        }
+    if live_target_head != expected:
+        repo_value = state.get("repo")
+        repository = Path(str(repo_value)).expanduser().resolve() if repo_value else None
+        recorded_integration = _is_recorded_integration_head(state, live_target_head)
+        try:
+            expected_is_ancestor = (
+                repository is not None
+                and recorded_integration
+                and is_ancestor(repository, expected, live_target_head)
+            )
+        except (OSError, RuntimeError):
+            expected_is_ancestor = False
+        if expected_is_ancestor:
+            # Integrating one ticket advances the target branch while the
+            # current frozen frontier still uses its original start SHA. This
+            # is legal only when the new HEAD is a recorded integration commit
+            # descended from that frozen base; unrelated target changes remain
+            # stale and block the scheduler.
+            return None
+        return {
+            "reason": "target branch HEAD differs from the persisted frontier SHA",
+            "expected_head": expected,
+            "actual_head": live_target_head,
+        }
+    return None
+
+
+def _build_audit_report(
+    state_arg: str,
+    *,
+    report_type: str,
+    dependency_ordered: bool,
+) -> dict[str, object]:
+    state_path, state = load_batch_state(state_arg)
+    state["state_path"] = str(state_path)
+    frontier = calculate_frontier(state)
+    live_target_head = _current_target_head(state)
+    target_drift = _target_drift(state, live_target_head)
+    if target_drift is not None:
+        blocked = frontier.get("blocked", {})
+        if not isinstance(blocked, dict):
+            blocked = {}
+        for record in state["tickets"]:
+            if not isinstance(record, dict):
+                continue
+            if str(record["status"]) not in RUNNABLE_STATUSES:
+                continue
+            ticket = str(record["ticket"])
+            details = dict(blocked.get(ticket, {}))
+            gates = list(details.get("gates", []))
+            gates.append("target:stale")
+            details["gates"] = list(dict.fromkeys(str(gate) for gate in gates))
+            details["status"] = str(record["status"])
+            details["reason"] = target_drift["reason"]
+            blocked[ticket] = details
+        frontier["frontier"] = []
+        frontier["runnable"] = []
+        frontier["blocked"] = blocked
+    if dependency_ordered:
+        records_by_ticket = {
+            str(record["ticket"]): cast(BatchTicketRecord, record)
+            for record in state["tickets"]
+        }
+        records = [records_by_ticket[ticket] for ticket in _dependency_order(state)]
+    else:
+        records = [
+            cast(BatchTicketRecord, record) for record in state["tickets"]
+        ]
+    entries = [
+        _audit_ticket(state, frontier, record, target_drift=target_drift)
+        for record in records
+    ]
+    complete, incomplete = _report_completion(entries, target_drift=target_drift)
+    tickets_by_id = {str(entry["ticket"]): entry for entry in entries}
+    blocked_reasons = {
+        str(entry["ticket"]): {
+            "unmet_predecessors": list(entry["unmet_predecessors"]),
+            "verification_gates": list(entry["verification_gates"]),
+            "reason": entry.get("reason"),
+        }
+        for entry in entries
+        if entry["unmet_predecessors"] or entry["verification_gates"] or entry["reason"]
+    }
+    return {
+        "verified": True,
+        "report_type": report_type,
+        "state_path": str(state_path),
+        "batch_id": state.get("batch_id"),
+        "repo": state.get("repo"),
+        "target_branch": state.get("target_branch"),
+        "target_head": live_target_head,
+        "target_drift": target_drift,
+        "starting_sha": state.get("starting_sha"),
+        "frontier_sha": frontier.get("frontier_sha"),
+        "frontier": list(frontier.get("frontier", [])),
+        "current_frontier": list(frontier.get("frontier", [])),
+        "runnable": list(frontier.get("runnable", [])),
+        "blocked": frontier.get("blocked", {}),
+        "tickets": entries,
+        "tickets_by_id": tickets_by_id,
+        "ticket_statuses": {
+            str(entry["ticket"]): entry["status"] for entry in entries
+        },
+        "dependency_order": [str(entry["ticket"]) for entry in entries],
+        "blocked_reasons": blocked_reasons,
+        "complete": complete,
+        "completion_status": "complete" if complete else "incomplete",
+        "incomplete_tickets": incomplete,
+    }
+
+
+def batch_status(state_arg: str) -> dict[str, object]:
+    """Return an auditable live projection of the current batch scheduler state."""
+
+    return _build_audit_report(
+        state_arg,
+        report_type="batch-status",
+        dependency_ordered=False,
+    )
+
+
+def completion_report(state_arg: str) -> dict[str, object]:
+    """Return dependency-ordered completion evidence without mutating state."""
+
+    return _build_audit_report(
+        state_arg,
+        report_type="completion-report",
+        dependency_ordered=True,
+    )
+
+
 def _find_batch_ticket(state: dict[str, object], ticket: str) -> BatchTicketRecord | None:
     records = state.get("tickets")
     if not isinstance(records, list):
@@ -2875,6 +3251,16 @@ def main() -> int:
     start_parser.add_argument("--worktree-root")
     start_parser.add_argument("--branch")
 
+    status_parser = subparsers.add_parser(
+        "status", help="report live batch status and blocked gates"
+    )
+    status_parser.add_argument("--state", required=True)
+
+    report_parser = subparsers.add_parser(
+        "report", help="report dependency-ordered completion evidence"
+    )
+    report_parser.add_argument("--state", required=True)
+
     finish_parser = subparsers.add_parser("finish")
     finish_parser.add_argument("--state", required=True)
 
@@ -2957,6 +3343,10 @@ def main() -> int:
                 worktree_root=args.worktree_root,
                 branch_name=args.branch,
             )
+        elif args.command == "status":
+            result = batch_status(args.state)
+        elif args.command == "report":
+            result = completion_report(args.state)
         elif args.command == "finish":
             result = finish_boundary(args.state)
         elif args.command == "integrate":
