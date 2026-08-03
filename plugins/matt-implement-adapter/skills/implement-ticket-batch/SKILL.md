@@ -87,6 +87,19 @@ The integration command records the integration state. It must run on the target
 worktree. Integrate independent tickets in a deterministic tracker order, and never integrate a dependent
 ticket before all of its predecessors are integrated.
 
+Integration alone does not unlock dependents. After the parent runs the required checks, record the explicit
+result before querying or starting the next frontier:
+
+```powershell
+python "<this-skill-directory>\scripts\ticket_boundary.py" verify `
+  --state "<state-path>" `
+  --result passed `
+  --checks-json '{"tests":"passed"}'
+```
+
+Use `--result failed` when a required check fails. Even a ticket with no extra checks must record an explicit
+`passed` result; an absent verification result keeps all dependents blocked.
+
 ### Handle merge conflicts
 
 If `merge` or `cherry-pick` reports a conflict:
@@ -135,7 +148,8 @@ python "<this-skill-directory>\scripts\ticket_boundary.py" finish --state "<stat
 ```
 
 Only continue when the worker boundary succeeds, exactly one commit was added, its worktree is clean, and
-the installed Matt workflow completed successfully. After successful integration and required checks, run:
+the installed Matt workflow completed successfully. After successful integration, explicit verification
+with `--result passed`, and any required checks, run:
 
 ```powershell
 python "<this-skill-directory>\scripts\ticket_boundary.py" cleanup --state "<state-path>"

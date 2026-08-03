@@ -34,6 +34,8 @@ TICKET_STATUSES = frozenset(
     }
 )
 RUNNABLE_STATUSES = frozenset({"planned", "runnable"})
+SATISFIED_PREDECESSOR_STATUSES = frozenset({"integrated", "cleaned"})
+VERIFICATION_RESULTS = frozenset({"passed", "failed"})
 TicketStatus = Literal[
     "planned",
     "runnable",
@@ -47,7 +49,33 @@ TicketStatus = Literal[
 ]
 
 
-class BatchTicketRecord(TypedDict):
+class IntegrationEvidence(TypedDict, total=False):
+    target_branch: str
+    strategy: str
+    commit: str
+    integrated_commit: str
+    integration_sha: str
+
+
+class VerificationEvidence(TypedDict, total=False):
+    result: str
+    status: str
+    required_checks: list[str]
+    checks: dict[str, object]
+    target_branch: str
+    target_head: str
+
+
+class BatchTicketLifecycle(TypedDict, total=False):
+    integration: IntegrationEvidence
+    verification: VerificationEvidence
+    integration_error: str
+    integration_target_branch: str
+    integration_strategy: str
+    integrated_commit: str
+
+
+class BatchTicketRecord(BatchTicketLifecycle):
     ticket: str
     dependencies: list[str]
     direct_dependencies: list[str]
@@ -302,6 +330,24 @@ def normalize_ticket_records(records: object) -> list[BatchTicketRecord]:
             "required_checks": normalized_checks,
             "status": cast(TicketStatus, status),
         }
+        # Keep lifecycle evidence on the ticket record when reloading a plan. The
+        # original batch-plan fields remain normalized, while integration and
+        # verification metadata is intentionally persisted for frontier checks.
+        if isinstance(raw, dict):
+            if "integration" in raw:
+                item["integration"] = cast(IntegrationEvidence, raw["integration"])
+            if "verification" in raw:
+                item["verification"] = cast(VerificationEvidence, raw["verification"])
+            if "integration_error" in raw:
+                item["integration_error"] = cast(str, raw["integration_error"])
+            if "integration_target_branch" in raw:
+                item["integration_target_branch"] = cast(
+                    str, raw["integration_target_branch"]
+                )
+            if "integration_strategy" in raw:
+                item["integration_strategy"] = cast(str, raw["integration_strategy"])
+            if "integrated_commit" in raw:
+                item["integrated_commit"] = cast(str, raw["integrated_commit"])
         normalized.append(item)
     if duplicates:
         raise BatchPlanError(
@@ -388,6 +434,228 @@ def _validate_worktree_slugs(records: list[BatchTicketRecord]) -> None:
         )
 
 
+def _validate_evidence_maps(
+    state: dict[str, object], identities: set[str]
+) -> None:
+    """Validate optional persisted integration/verification evidence maps."""
+
+    for field in ("integrations", "verifications"):
+        value = state.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise BatchPlanError(
+                f"{field} must be a JSON object",
+                error_code="batch_state_corrupt",
+            )
+        unknown = sorted(str(ticket) for ticket in value if ticket not in identities)
+        if unknown:
+            raise BatchPlanError(
+                f"{field} contains an unknown ticket",
+                error_code="batch_state_corrupt",
+                details={"unknown_tickets": unknown},
+            )
+        for ticket, evidence in value.items():
+            if not isinstance(evidence, dict):
+                raise BatchPlanError(
+                    f"{field} for ticket {ticket!r} must be a JSON object",
+                    error_code="batch_state_corrupt",
+                )
+
+
+def _validate_mirrored_evidence(
+    state: dict[str, object], records: list[BatchTicketRecord]
+) -> None:
+    """Reject divergent lifecycle evidence copied to record and top-level maps."""
+
+    for record in records:
+        ticket = str(record["ticket"])
+        for record_field, map_field, record_evidence in (
+            ("integration", "integrations", record.get("integration")),
+            ("verification", "verifications", record.get("verification")),
+        ):
+            values = state.get(map_field)
+            map_evidence = (
+                values.get(ticket)
+                if isinstance(values, dict) and ticket in values
+                else None
+            )
+            if record_evidence is not None and map_evidence is not None and record_evidence != map_evidence:
+                raise BatchPlanError(
+                    f"{record_field} evidence differs between ticket record and {map_field} map",
+                    error_code="batch_state_corrupt",
+                    details={"ticket": ticket, "record_field": record_field, "map_field": map_field},
+                )
+            ticket_states = state.get("ticket_states")
+            ticket_state = (
+                ticket_states.get(ticket)
+                if isinstance(ticket_states, dict) and ticket in ticket_states
+                else None
+            )
+            ticket_state_evidence = (
+                ticket_state.get(record_field)
+                if isinstance(ticket_state, dict)
+                else None
+            )
+            canonical_evidence = record_evidence if record_evidence is not None else map_evidence
+            if (
+                ticket_state_evidence is not None
+                and canonical_evidence is not None
+                and ticket_state_evidence != canonical_evidence
+            ):
+                raise BatchPlanError(
+                    f"{record_field} evidence differs in ticket state for {ticket!r}",
+                    error_code="batch_state_corrupt",
+                    details={"ticket": ticket, "field": record_field},
+                )
+
+
+def _integration_commit(evidence: object) -> str | None:
+    if not isinstance(evidence, dict):
+        return None
+    values: list[object] = [
+        evidence[field]
+        for field in ("commit", "integrated_commit", "integration_sha")
+        if field in evidence
+    ]
+    if not values or any(not isinstance(value, str) or not value for value in values):
+        return None
+    if len(set(values)) != 1:
+        return None
+    return str(values[0])
+
+
+def _is_passed_check(value: object) -> bool:
+    return value is True or (
+        isinstance(value, str)
+        and value.strip().lower()
+        in {"passed", "pass", "success", "succeeded", "ok", "true"}
+    )
+
+
+def _validate_ticket_evidence(
+    record: BatchTicketRecord,
+    required_checks: list[str] | None = None,
+) -> None:
+    integration = record.get("integration")
+    if integration is not None:
+        if not isinstance(integration, dict):
+            raise BatchPlanError(
+                f"integration evidence for ticket {record['ticket']!r} must be a JSON object",
+                error_code="batch_state_corrupt",
+            )
+        integration_aliases = [
+            integration[field]
+            for field in ("commit", "integrated_commit", "integration_sha")
+            if field in integration
+        ]
+        if (
+            len(integration_aliases) > 1
+            and all(isinstance(value, str) for value in integration_aliases)
+            and len(set(integration_aliases)) != 1
+        ):
+            raise BatchPlanError(
+                f"integration evidence aliases differ; evidence differs for ticket {record['ticket']!r}",
+                error_code="batch_state_corrupt",
+                details={"ticket": record["ticket"]},
+            )
+        commit = _integration_commit(integration)
+        for field, value in (
+            ("target_branch", integration.get("target_branch")),
+            ("strategy", integration.get("strategy")),
+            ("commit", commit),
+        ):
+            if not isinstance(value, str) or not value:
+                raise BatchPlanError(
+                    f"integration evidence for ticket {record['ticket']!r} is incomplete",
+                    error_code="batch_state_corrupt",
+                    details={"ticket": record["ticket"], "missing_field": field},
+                )
+        if integration.get("strategy") not in {"merge", "cherry-pick"}:
+            raise BatchPlanError(
+                f"integration strategy for ticket {record['ticket']!r} is unsupported",
+                error_code="batch_state_corrupt",
+                details={"ticket": record["ticket"], "strategy": integration.get("strategy")},
+            )
+    verification = record.get("verification")
+    if verification is not None:
+        if not isinstance(verification, dict):
+            raise BatchPlanError(
+                f"verification evidence for ticket {record['ticket']!r} must be a JSON object",
+                error_code="batch_state_corrupt",
+            )
+        result_value = verification.get("result")
+        status_value = verification.get("status")
+        if result_value is not None and status_value is not None and result_value != status_value:
+            raise BatchPlanError(
+                f"verification result/status disagree for ticket {record['ticket']!r}",
+                error_code="batch_state_corrupt",
+                details={"ticket": record["ticket"]},
+            )
+        result = result_value if result_value is not None else status_value
+        if result not in VERIFICATION_RESULTS:
+            raise BatchPlanError(
+                f"verification result for ticket {record['ticket']!r} is unsupported",
+                error_code="batch_state_corrupt",
+                details={"ticket": record["ticket"], "result": result},
+            )
+        if required_checks is not None:
+            evidence_checks = verification.get("required_checks")
+            if evidence_checks != required_checks:
+                raise BatchPlanError(
+                    f"verification required-check declaration for ticket {record['ticket']!r} is invalid",
+                    error_code="batch_state_corrupt",
+                    details={
+                        "ticket": record["ticket"],
+                        "required_checks": required_checks,
+                        "evidence_checks": evidence_checks,
+                    },
+                )
+            check_results = verification.get("checks")
+            if not isinstance(check_results, dict):
+                raise BatchPlanError(
+                    f"verification checks for ticket {record['ticket']!r} must be a JSON object",
+                    error_code="batch_state_corrupt",
+                )
+            unknown_checks = sorted(
+                str(check) for check in check_results if check not in required_checks
+            )
+            if unknown_checks:
+                raise BatchPlanError(
+                    f"verification checks for ticket {record['ticket']!r} contain unknown checks",
+                    error_code="batch_state_corrupt",
+                    details={"ticket": record["ticket"], "unknown_checks": unknown_checks},
+                )
+            if result == "passed":
+                missing_checks = [
+                    check for check in required_checks if check not in check_results
+                ]
+                if missing_checks:
+                    raise BatchPlanError(
+                        f"passed verification for ticket {record['ticket']!r} is missing required checks",
+                        error_code="batch_state_corrupt",
+                        details={"ticket": record["ticket"], "missing_checks": missing_checks},
+                    )
+                failed_checks = [
+                    check
+                    for check in required_checks
+                    if not _is_passed_check(check_results[check])
+                ]
+                if failed_checks:
+                    raise BatchPlanError(
+                        f"passed verification for ticket {record['ticket']!r} contains failed checks",
+                        error_code="batch_state_corrupt",
+                        details={"ticket": record["ticket"], "failed_checks": failed_checks},
+                    )
+            for field in ("target_branch", "target_head"):
+                if not isinstance(verification.get(field), str) or not verification[field]:
+                    raise BatchPlanError(
+                        f"verification evidence for ticket {record['ticket']!r} is incomplete",
+                        error_code="batch_state_corrupt",
+                        details={"ticket": record["ticket"], "missing_field": field},
+                    )
+
+
 def validate_batch_plan(state: dict[str, object]) -> None:
     if state.get("schema_version") != BATCH_PLAN_SCHEMA_VERSION:
         raise BatchPlanError(
@@ -440,12 +708,51 @@ def validate_batch_plan(state: dict[str, object]) -> None:
         )
     for ticket, values in checks.items():
         _string_list(values, "required_checks", str(ticket))
+    _validate_evidence_maps(state, identities)
+    for record in records:
+        _validate_ticket_evidence(record, list(checks[str(record["ticket"])]))
+    verifications = state.get("verifications")
+    if isinstance(verifications, dict):
+        for ticket, evidence in verifications.items():
+            synthetic: BatchTicketRecord = {
+                "ticket": str(ticket),
+                "dependencies": [],
+                "direct_dependencies": [],
+                "required_checks": list(checks[str(ticket)]),
+                "status": "integrated",
+                "verification": cast(VerificationEvidence, evidence),
+            }
+            _validate_ticket_evidence(synthetic, list(checks[str(ticket)]))
+    integrations = state.get("integrations")
+    if isinstance(integrations, dict):
+        for ticket, evidence in integrations.items():
+            synthetic: BatchTicketRecord = {
+                "ticket": str(ticket),
+                "dependencies": [],
+                "direct_dependencies": [],
+                "required_checks": list(checks[str(ticket)]),
+                "status": "integrated",
+                "integration": cast(IntegrationEvidence, evidence),
+            }
+            _validate_ticket_evidence(synthetic)
+    _validate_mirrored_evidence(state, records)
     if "frontier" in state and (
         not isinstance(state["frontier"], list)
         or any(not isinstance(ticket, str) or ticket not in identities for ticket in state["frontier"])
     ):
         raise BatchPlanError(
             "persisted frontier contains an unknown or invalid ticket",
+            error_code="batch_state_corrupt",
+        )
+    if "frontier_tickets" in state and (
+        not isinstance(state["frontier_tickets"], list)
+        or any(
+            not isinstance(ticket, str) or ticket not in identities
+            for ticket in state["frontier_tickets"]
+        )
+    ):
+        raise BatchPlanError(
+            "persisted frontier_tickets contains an unknown or invalid ticket",
             error_code="batch_state_corrupt",
         )
     ticket_states = state.get("ticket_states")
@@ -505,6 +812,16 @@ def validate_batch_plan(state: dict[str, object]) -> None:
                         "batch_status": record_status,
                     },
                 )
+            if ticket_status in {"finished", "integrated", "cleaned"} and ticket_status != record_status:
+                raise BatchPlanError(
+                    f"ticket state status does not match batch ticket {ticket!r}",
+                    error_code="batch_state_corrupt",
+                    details={
+                        "ticket": ticket,
+                        "ticket_status": ticket_status,
+                        "batch_status": record_status,
+                    },
+                )
 
 
 def calculate_frontier(state: dict[str, object]) -> dict[str, object]:
@@ -533,12 +850,31 @@ def _calculate_frontier(state: dict[str, object]) -> dict[str, object]:
             }
             continue
         if dependencies:
-            blocked[ticket] = {
-                "predecessors": dependencies,
-                "gates": [],
-                "status": status,
-                "reason": "ticket has declared predecessors",
-            }
+            unmet_predecessors: list[str] = []
+            gates: list[str] = []
+            repository = Path(str(state.get("repo", ""))).expanduser().resolve()
+            target_head = str(state.get("frontier_sha", state.get("starting_sha")))
+            for dependency in dependencies:
+                gate, _ = _evaluate_predecessor(
+                    repository,
+                    state,
+                    dependency,
+                    target_head,
+                )
+                if gate == "predecessor":
+                    unmet_predecessors.append(dependency)
+                elif gate is not None:
+                    gates.append(f"{dependency}:{gate}")
+
+            if not unmet_predecessors and not gates:
+                frontier.append(ticket)
+            else:
+                blocked[ticket] = {
+                    "predecessors": unmet_predecessors,
+                    "gates": gates,
+                    "status": status,
+                    "reason": "ticket predecessors or integration verification are not satisfied",
+                }
         else:
             frontier.append(ticket)
     return {
@@ -550,6 +886,7 @@ def _calculate_frontier(state: dict[str, object]) -> dict[str, object]:
         "repo": state.get("repo"),
         "target_branch": state["target_branch"],
         "starting_sha": state["starting_sha"],
+        "frontier_sha": state.get("frontier_sha", state["starting_sha"]),
         "tickets": tickets,
         "dependencies": {
             str(record["ticket"]): list(record["dependencies"]) for record in tickets
@@ -559,6 +896,41 @@ def _calculate_frontier(state: dict[str, object]) -> dict[str, object]:
         "runnable": frontier,
         "blocked": blocked,
     }
+
+
+def _frontier_generation_tickets(state: dict[str, object]) -> list[str]:
+    """Return the tickets captured when the current frozen frontier opened."""
+
+    value = state.get("frontier_tickets")
+    if isinstance(value, list):
+        return [str(ticket) for ticket in value]
+    # Plans written before the frozen-frontier snapshot was introduced can be
+    # read safely by treating their persisted projection as the first snapshot.
+    frontier = state.get("frontier")
+    if isinstance(frontier, list):
+        return [str(ticket) for ticket in frontier]
+    return []
+
+
+def _frontier_generation_is_complete(
+    state: dict[str, object], tickets: list[str]
+) -> bool:
+    if not tickets:
+        return False
+    records = {
+        str(record["ticket"]): record
+        for record in state.get("tickets", [])
+        if isinstance(record, dict)
+    }
+    return all(
+        str(records[ticket]["status"]) in SATISFIED_PREDECESSOR_STATUSES
+        and (
+            (verification := _ticket_verification(records[ticket], state)) is not None
+            and verification.get("result", verification.get("status")) == "passed"
+        )
+        for ticket in tickets
+        if ticket in records
+    ) and all(ticket in records for ticket in tickets)
 
 
 def _read_tickets_argument(value: str) -> object:
@@ -639,16 +1011,20 @@ def create_batch_plan(
         "target_branch": branch,
         "starting_sha": resolved_start,
         "frontier_sha": resolved_start,
+        "frontier_tickets": [],
         "tickets": records,
         "dependencies": {
             str(record["ticket"]): list(record["dependencies"]) for record in records
         },
         "required_checks": required_checks,
+        "integrations": {},
+        "verifications": {},
         "frontier_generation": 0,
     }
     initial_frontier = _calculate_frontier(plan)
     plan["frontier"] = list(initial_frontier["frontier"])
     plan["runnable"] = list(initial_frontier["runnable"])
+    plan["frontier_tickets"] = list(initial_frontier["frontier"])
     with batch_state_lock(state_path):
         if state_path.exists():
             raise BatchPlanError(
@@ -674,6 +1050,195 @@ def _find_batch_ticket(state: dict[str, object], ticket: str) -> BatchTicketReco
     return None
 
 
+def _ticket_batch_state_path(ticket_state: dict[str, object]) -> Path | None:
+    value = ticket_state.get("batch_state_path", ticket_state.get("batch_state"))
+    if value is None or not str(value).strip():
+        return None
+    return Path(str(value)).expanduser().resolve()
+
+
+def _ticket_verification(
+    record: BatchTicketRecord, state: dict[str, object]
+) -> VerificationEvidence | None:
+    evidence = record.get("verification")
+    if isinstance(evidence, dict):
+        return evidence
+    values = state.get("verifications")
+    if isinstance(values, dict):
+        evidence = values.get(str(record["ticket"]))
+        if isinstance(evidence, dict):
+            return cast(VerificationEvidence, evidence)
+    return None
+
+
+def _ticket_integration(
+    record: BatchTicketRecord, state: dict[str, object]
+) -> IntegrationEvidence | None:
+    evidence = record.get("integration")
+    if isinstance(evidence, dict):
+        return evidence
+    legacy_commit = record.get("integrated_commit")
+    if isinstance(legacy_commit, str) and legacy_commit:
+        return {
+            "target_branch": record.get("integration_target_branch", ""),
+            "strategy": record.get("integration_strategy", ""),
+            "commit": legacy_commit,
+        }
+    values = state.get("integrations")
+    if isinstance(values, dict):
+        evidence = values.get(str(record["ticket"]))
+        if isinstance(evidence, dict):
+            return cast(IntegrationEvidence, evidence)
+    return None
+
+
+def _evaluate_predecessor(
+    repo: Path,
+    state: dict[str, object],
+    dependency: str,
+    target_head: str,
+) -> tuple[str | None, dict[str, object] | None]:
+    """Return the first unmet predecessor gate and verified evidence, if any."""
+
+    predecessor = _find_batch_ticket(state, dependency)
+    if predecessor is None or str(predecessor["status"]) not in SATISFIED_PREDECESSOR_STATUSES:
+        return "predecessor", None
+
+    integration = _ticket_integration(predecessor, state)
+    if integration is None:
+        return "integration", None
+    if integration.get("target_branch") != state.get("target_branch"):
+        return "integration", None
+    commit = _integration_commit(integration)
+    if commit is None:
+        return "integration", None
+    try:
+        if not is_ancestor(repo, commit, target_head):
+            return "ancestry", None
+    except (OSError, RuntimeError):
+        return "ancestry", None
+
+    verification = _ticket_verification(predecessor, state)
+    verification_result = (
+        verification.get("result", verification.get("status"))
+        if verification is not None
+        else None
+    )
+    if verification_result != "passed":
+        return "verification", None
+    if verification.get("target_branch") != state.get("target_branch"):
+        return "verification", None
+    verification_head = verification.get("target_head")
+    if not isinstance(verification_head, str) or not verification_head:
+        return "verification", None
+    try:
+        if not is_ancestor(repo, commit, verification_head):
+            return "verification", None
+        if not is_ancestor(repo, verification_head, target_head):
+            return "verification", None
+    except (OSError, RuntimeError):
+        return "verification", None
+    return None, {
+        "integration_sha": commit,
+        "target_branch": integration.get("target_branch"),
+        "strategy": integration.get("strategy"),
+        "verification_result": "passed",
+        "verification_target_head": verification_head,
+        "ancestor": True,
+    }
+
+
+def _persist_batch_ticket_state(
+    ticket_state: dict[str, object],
+    *,
+    status: str,
+    integration: IntegrationEvidence | None = None,
+    verification: VerificationEvidence | None = None,
+    integration_error: str | None = None,
+) -> dict[str, object] | None:
+    """Mirror a ticket lifecycle transition into its validated batch plan."""
+
+    batch_path = _ticket_batch_state_path(ticket_state)
+    if batch_path is None:
+        return None
+
+    ticket = str(ticket_state.get("ticket", ""))
+    with batch_state_lock(batch_path):
+        batch = _load_batch_state_unlocked(batch_path)
+        batch["state_path"] = str(batch_path)
+        record = _find_batch_ticket(batch, ticket)
+        if record is None:
+            raise BatchPlanError(
+                f"ticket is not present in the batch plan: {ticket}",
+                error_code="ticket_unknown",
+            )
+
+        record["status"] = cast(TicketStatus, status)
+        if integration is not None:
+            record["integration"] = integration
+            record["integration_target_branch"] = integration.get("target_branch", "")
+            record["integration_strategy"] = integration.get("strategy", "")
+            record["integrated_commit"] = _integration_commit(integration) or ""
+            integrations = batch.setdefault("integrations", {})
+            if not isinstance(integrations, dict):
+                raise BatchPlanError("integrations must be a JSON object", error_code="batch_state_corrupt")
+            integrations[ticket] = integration
+        if verification is not None:
+            record["verification"] = verification
+            verifications = batch.setdefault("verifications", {})
+            if not isinstance(verifications, dict):
+                raise BatchPlanError("verifications must be a JSON object", error_code="batch_state_corrupt")
+            verifications[ticket] = verification
+        if integration_error is not None:
+            record["integration_error"] = integration_error
+        elif "integration_error" in record:
+            record.pop("integration_error", None)
+
+        ticket_states = batch.setdefault("ticket_states", {})
+        if not isinstance(ticket_states, dict):
+            raise BatchPlanError("ticket_states must be a JSON object", error_code="batch_state_corrupt")
+        mirrored = dict(ticket_state)
+        mirrored["status"] = status
+        if integration is not None:
+            mirrored["integration"] = integration
+        if verification is not None:
+            mirrored["verification"] = verification
+        if integration_error is not None:
+            mirrored["integration_error"] = integration_error
+        ticket_states[ticket] = mirrored
+
+        next_frontier = _calculate_frontier(batch)
+        batch["frontier"] = list(next_frontier["frontier"])
+        batch["runnable"] = list(next_frontier["runnable"])
+        _atomic_write_json(batch_path, batch)
+    return batch
+
+
+def _predecessor_evidence(
+    repo: Path,
+    state: dict[str, object],
+    ticket: str,
+    target_head: str,
+) -> tuple[list[str], list[str], dict[str, object]]:
+    record = _find_batch_ticket(state, ticket)
+    if record is None:
+        return [], [], {}
+    unmet: list[str] = []
+    gates: list[str] = []
+    evidence: dict[str, object] = {}
+    for dependency in record["dependencies"]:
+        gate, predecessor_evidence = _evaluate_predecessor(
+            repo, state, dependency, target_head
+        )
+        if gate == "predecessor":
+            unmet.append(dependency)
+        elif gate is not None:
+            gates.append(f"{dependency}:{gate}")
+        elif predecessor_evidence is not None:
+            evidence[dependency] = predecessor_evidence
+    return unmet, gates, evidence
+
+
 def _start_failure_details(
     state: dict[str, object],
     ticket: str,
@@ -696,6 +1261,30 @@ def _start_failure_details(
         "target_branch": state.get("target_branch"),
         "reason": reason or "ticket is not in the current runnable frontier",
     }
+
+
+def _is_recorded_integration_head(
+    state: dict[str, object], target_head: str
+) -> bool:
+    """Allow a frozen frontier to coexist with a recorded integration commit."""
+
+    records = state.get("tickets")
+    if not isinstance(records, list):
+        return False
+    for raw_record in records:
+        if not isinstance(raw_record, dict):
+            continue
+        if str(raw_record.get("status")) not in SATISFIED_PREDECESSOR_STATUSES:
+            continue
+        record = cast(BatchTicketRecord, raw_record)
+        integration = _ticket_integration(record, state)
+        if (
+            isinstance(integration, dict)
+            and integration.get("target_branch") == state.get("target_branch")
+            and _integration_commit(integration) == target_head
+        ):
+            return True
+    return False
 
 
 def _target_failure_details(
@@ -762,18 +1351,42 @@ def _require_start_target(
 
     expected_head = str(state.get("frontier_sha", state["starting_sha"]))
     if target_head != expected_head:
-        raise BatchPlanError(
-            "target HEAD changed after the batch frontier was frozen",
-            error_code="target_head_stale",
-            details=_target_failure_details(
-                state,
-                ticket,
-                target_head=target_head,
-                expected_head=expected_head,
-                target_branch=actual_branch,
-            ),
-        )
-    return actual_branch, target_head
+        recorded_integration = _is_recorded_integration_head(state, target_head)
+        try:
+            expected_is_ancestor = is_ancestor(repo, expected_head, target_head)
+        except (OSError, RuntimeError):
+            expected_is_ancestor = False
+        if not recorded_integration or not expected_is_ancestor:
+            raise BatchPlanError(
+                "target HEAD changed after the batch frontier was frozen",
+                error_code="target_head_stale",
+                details=_target_failure_details(
+                    state,
+                    ticket,
+                    target_head=target_head,
+                    expected_head=expected_head,
+                    target_branch=actual_branch,
+                ),
+            )
+
+    start_sha = expected_head
+
+    if ticket is not None:
+        unmet, gates, _ = _predecessor_evidence(repo, state, ticket, target_head)
+        if gates and any(gate.endswith(":ancestry") for gate in gates):
+            raise BatchPlanError(
+                f"predecessor integration is not an ancestor of target HEAD for {ticket!r}",
+                error_code="predecessor_not_ancestor",
+                details=_start_failure_details(
+                    state,
+                    ticket,
+                    target_head=start_sha,
+                    predecessors=unmet,
+                    gates=gates,
+                    reason="target HEAD does not contain every predecessor integrated commit",
+                ),
+            )
+    return actual_branch, start_sha
 
 
 def load_state(state_arg: str) -> tuple[Path, dict[str, object]]:
@@ -857,9 +1470,8 @@ def start_boundary(
                 ),
             )
         if ticket not in runnable:
-            reason = str(
-                frontier["blocked"].get(ticket, {}).get("reason", "ticket is not runnable")
-            )
+            blocked_details = frontier["blocked"].get(ticket, {})
+            reason = str(blocked_details.get("reason", "ticket is not runnable"))
             raise BatchPlanError(
                 f"ticket {ticket!r} is not in the current runnable frontier",
                 error_code="ticket_not_runnable",
@@ -868,10 +1480,27 @@ def start_boundary(
                     ticket,
                     target_head=start_sha,
                     status=str(record["status"]),
-                    predecessors=list(record["dependencies"])
-                    if str(record["status"]) in RUNNABLE_STATUSES
-                    else [],
+                    predecessors=list(blocked_details.get("predecessors", [])),
+                    gates=list(blocked_details.get("gates", [])),
                     reason=reason,
+                ),
+            )
+
+        unmet, gates, predecessor_evidence = _predecessor_evidence(
+            main_repo, state, ticket, start_sha
+        )
+        if unmet or gates:
+            raise BatchPlanError(
+                f"ticket {ticket!r} is not in the current runnable frontier",
+                error_code="ticket_not_runnable",
+                details=_start_failure_details(
+                    state,
+                    ticket,
+                    target_head=start_sha,
+                    status=str(record["status"]),
+                    predecessors=unmet,
+                    gates=gates,
+                    reason="ticket predecessors or integration verification are not satisfied",
                 ),
             )
 
@@ -932,8 +1561,8 @@ def start_boundary(
             "batch_state_path": str(batch_state_path),
             "batch_id": state.get("batch_id"),
             "frontier_generation": frontier_generation,
-            "predecessor_evidence": {},
-            "predecessor_integration_evidence": {},
+            "predecessor_evidence": predecessor_evidence,
+            "predecessor_integration_evidence": predecessor_evidence,
         }
 
         try:
@@ -1010,12 +1639,58 @@ def finish_boundary(state_arg: str) -> dict[str, object]:
         }
     )
     write_state(state_path, state)
+    _persist_batch_ticket_state(state, status="finished")
     return state
 
 
 def integration_error(result: subprocess.CompletedProcess) -> str:
     detail = result.stderr.strip() or result.stdout.strip() or "git integration failed"
     return f"integration conflict or failure: {detail}"
+
+
+def _require_cherry_pick_recovery_evidence(
+    repo: Path,
+    state: dict[str, object],
+    head_sha: str,
+) -> None:
+    """Reject ``--continue`` after an aborted pick plus an unrelated commit."""
+
+    final_sha = str(state["final_sha"])
+    reflog_entries = run_git(
+        repo,
+        "reflog",
+        "--format=%H%x09%gs",
+        str(state["target_branch"]),
+    ).splitlines()
+    head_reflog = [entry for entry in reflog_entries if entry.startswith(f"{head_sha}\t")]
+    source_subject = run_git(repo, "show", "-s", "--format=%s", final_sha)
+    head_subject = run_git(repo, "show", "-s", "--format=%s", head_sha)
+    if source_subject != head_subject:
+        raise RuntimeError("integrated HEAD does not contain the cherry-picked ticket commit")
+
+    source_files = {
+        path
+        for path in run_git(repo, "diff", "--name-only", f"{final_sha}^", final_sha).splitlines()
+        if path
+    }
+    target_files = {
+        path
+        for path in run_git(
+            repo,
+            "diff",
+            "--name-only",
+            f"{state['integration_start_sha']}..{head_sha}",
+        ).splitlines()
+        if path
+    }
+    if not source_files or not source_files.issubset(target_files):
+        raise RuntimeError("integrated HEAD does not contain the cherry-picked ticket commit")
+
+    if not any(
+        "cherry-pick" in entry.lower() and "abort" not in entry.lower()
+        for entry in head_reflog
+    ):
+        raise RuntimeError("integrated HEAD does not contain the cherry-picked ticket commit")
 
 
 def mark_integrated(
@@ -1034,17 +1709,32 @@ def mark_integrated(
     if strategy == "merge":
         if not is_ancestor(repo, final_sha, head_sha):
             raise RuntimeError("integrated HEAD does not contain the ticket commit")
+    elif state.get("status") == "integration_conflict":
+        _require_cherry_pick_recovery_evidence(repo, state, head_sha)
 
+    integration: IntegrationEvidence = {
+        "target_branch": target_branch,
+        "strategy": strategy,
+        "commit": head_sha,
+        "integrated_commit": head_sha,
+        "integration_sha": head_sha,
+    }
     state.update(
         {
             "status": "integrated",
             "integration_strategy": strategy,
             "integrated_into": target_branch,
             "integration_sha": head_sha,
+            "integration": integration,
         }
     )
     state.pop("integration_error", None)
     write_state(state_path, state)
+    _persist_batch_ticket_state(
+        state,
+        status="integrated",
+        integration=integration,
+    )
     return state
 
 
@@ -1063,6 +1753,16 @@ def integrate_boundary(
     target = target_branch or str(state.get("base_branch", ""))
     if not target:
         raise ValueError("state does not contain a target branch")
+    batch_path = _ticket_batch_state_path(state)
+    if batch_path is not None:
+        _, batch_plan = load_batch_state(str(batch_path))
+        expected_target = str(batch_plan["target_branch"])
+        if target != expected_target:
+            raise BatchPlanError(
+                "integration target branch does not match the batch plan",
+                error_code="target_branch_mismatch",
+                details={"expected_branch": expected_target, "actual_branch": target},
+            )
     assert_current_branch(main_repo, target)
 
     if continue_integration:
@@ -1108,6 +1808,11 @@ def integrate_boundary(
         state["status"] = "integration_conflict"
         state["integration_error"] = integration_error(result)
         write_state(state_path, state)
+        _persist_batch_ticket_state(
+            state,
+            status="integration_conflict",
+            integration_error=str(state["integration_error"]),
+        )
         raise RuntimeError(str(state["integration_error"]))
 
     return mark_integrated(
@@ -1119,10 +1824,293 @@ def integrate_boundary(
     )
 
 
+def _parse_check_results(
+    value: object,
+    required_checks: list[str],
+    *,
+    result: str,
+) -> dict[str, object]:
+    if value is None:
+        value = {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise BatchPlanError(
+                "verification checks must be valid JSON",
+                error_code="verification_invalid",
+                details={"reason": str(error)},
+            ) from error
+    if not isinstance(value, dict):
+        raise BatchPlanError(
+            "verification checks must be a JSON object",
+            error_code="verification_invalid",
+        )
+    unknown = sorted(str(check) for check in value if check not in required_checks)
+    if unknown:
+        raise BatchPlanError(
+            "verification contains an unknown required check",
+            error_code="verification_invalid",
+            details={"unknown_checks": unknown},
+        )
+    check_results = {str(check): check_result for check, check_result in value.items()}
+    if result == "passed":
+        missing = [check for check in required_checks if check not in check_results]
+        if missing:
+            raise BatchPlanError(
+                "a passed verification must include every required check",
+                error_code="verification_invalid",
+                details={"missing_checks": missing},
+            )
+        failed = [
+            check
+            for check, check_result in check_results.items()
+            if not _is_passed_check(check_result)
+        ]
+        if failed:
+            raise BatchPlanError(
+                "a passed verification cannot contain failed required checks",
+                error_code="verification_invalid",
+                details={"failed_checks": failed},
+            )
+    return check_results
+
+
+def record_verification(
+    state_arg: str,
+    *,
+    result: str,
+    checks: object = None,
+) -> dict[str, object]:
+    """Record the parent's explicit required-check result for an integrated ticket."""
+
+    if result not in VERIFICATION_RESULTS:
+        raise BatchPlanError(
+            "verification result must be 'passed' or 'failed'",
+            error_code="verification_invalid",
+            details={"result": result},
+        )
+
+    state_path, ticket_state = load_state(state_arg)
+    if ticket_state.get("status") != "integrated":
+        raise BatchPlanError(
+            "required-check verification requires a successfully integrated ticket",
+            error_code="verification_not_ready",
+            details={"ticket": ticket_state.get("ticket"), "status": ticket_state.get("status")},
+        )
+    batch_path = _ticket_batch_state_path(ticket_state)
+    if batch_path is None:
+        raise BatchPlanError(
+            "required-check verification requires a batch state",
+            error_code="batch_state_missing",
+            details={"guidance": "record verification against the validated batch plan"},
+        )
+
+    ticket = str(ticket_state.get("ticket", ""))
+    repo = resolve_repo(str(ticket_state["repo"]))
+    with batch_state_lock(batch_path):
+        batch = _load_batch_state_unlocked(batch_path)
+        record = _find_batch_ticket(batch, ticket)
+        if record is None:
+            raise BatchPlanError(
+                f"ticket is not present in the batch plan: {ticket}",
+                error_code="ticket_unknown",
+            )
+        if str(record["status"]) != "integrated":
+            raise BatchPlanError(
+                "required-check verification requires a successfully integrated ticket",
+                error_code="verification_not_ready",
+                details={"ticket": ticket, "status": record["status"]},
+            )
+        integration = _ticket_integration(record, batch)
+        if integration is None:
+            raise BatchPlanError(
+                "integrated ticket is missing integration evidence",
+                error_code="batch_state_corrupt",
+                details={"ticket": ticket},
+            )
+        target_branch = str(integration["target_branch"])
+        assert_current_branch(repo, target_branch)
+        require_clean(repo)
+        target_head = run_git(repo, "rev-parse", "HEAD")
+        integration_commit = _integration_commit(integration)
+        if integration_commit is None:
+            raise BatchPlanError(
+                "integrated ticket is missing an integration commit",
+                error_code="batch_state_corrupt",
+                details={"ticket": ticket},
+            )
+        if not is_ancestor(repo, integration_commit, target_head):
+            raise BatchPlanError(
+                "integration commit is not an ancestor of the verification target HEAD",
+                error_code="predecessor_not_ancestor",
+                details={
+                    "ticket": ticket,
+                    "integration_commit": integration_commit,
+                    "target_head": target_head,
+                },
+            )
+
+        required_checks_map = batch.get("required_checks")
+        if not isinstance(required_checks_map, dict):
+            raise BatchPlanError(
+                "required_checks must map every ticket identity exactly once",
+                error_code="batch_state_corrupt",
+            )
+        required_checks = list(required_checks_map.get(ticket, []))
+        check_results = _parse_check_results(
+            checks,
+            required_checks,
+            result=result,
+        )
+        verification: VerificationEvidence = {
+            "result": result,
+            "status": result,
+            "required_checks": required_checks,
+            "checks": check_results,
+            "target_branch": target_branch,
+            "target_head": target_head,
+        }
+        record["verification"] = verification
+        verifications = batch.setdefault("verifications", {})
+        if not isinstance(verifications, dict):
+            raise BatchPlanError("verifications must be a JSON object", error_code="batch_state_corrupt")
+        verifications[ticket] = verification
+        ticket_states = batch.setdefault("ticket_states", {})
+        if not isinstance(ticket_states, dict):
+            raise BatchPlanError("ticket_states must be a JSON object", error_code="batch_state_corrupt")
+        mirrored = dict(ticket_state)
+        mirrored["verification"] = verification
+        mirrored["verification_result"] = result
+        mirrored["verification_target_head"] = target_head
+        ticket_states[ticket] = mirrored
+        if result == "passed":
+            generation_tickets = _frontier_generation_tickets(batch)
+            if (
+                ticket in generation_tickets
+                and _frontier_generation_is_complete(batch, generation_tickets)
+            ):
+                # Keep every ticket in one frozen frontier on the same base
+                # until that generation has been integrated and verified in
+                # full. Only then can the next frontier open at this target.
+                batch["frontier_sha"] = target_head
+                batch["frontier_generation"] = int(
+                    batch.get("frontier_generation", 0)
+                ) + 1
+                next_frontier = _calculate_frontier(batch)
+                batch["frontier_tickets"] = list(next_frontier["frontier"])
+        next_frontier = _calculate_frontier(batch)
+        batch["frontier"] = list(next_frontier["frontier"])
+        batch["runnable"] = list(next_frontier["runnable"])
+        _atomic_write_json(batch_path, batch)
+
+    ticket_state.update(
+        {
+            "verification": verification,
+            "verification_result": result,
+            "verification_target_head": target_head,
+        }
+    )
+    write_state(state_path, ticket_state)
+    return ticket_state
+
+
+def verify_boundary(
+    state_arg: str,
+    *,
+    result: str,
+    checks: object = None,
+) -> dict[str, object]:
+    """Compatibility alias for callers that name the operation ``verify``."""
+
+    return record_verification(state_arg, result=result, checks=checks)
+
+
+def _require_cleanup_verification(ticket_state: dict[str, object]) -> None:
+    batch_path = _ticket_batch_state_path(ticket_state)
+    if batch_path is None:
+        return
+    _, batch = load_batch_state(str(batch_path))
+    ticket = str(ticket_state.get("ticket", ""))
+    record = _find_batch_ticket(batch, ticket)
+    verification = _ticket_verification(record, batch) if record is not None else None
+    result = (
+        verification.get("result", verification.get("status"))
+        if verification is not None
+        else None
+    )
+    if record is None or str(record["status"]) != "integrated" or result != "passed":
+        raise BatchPlanError(
+            "cleanup requires integration and an explicit passed verification result",
+            error_code="verification_required",
+            details={"ticket": ticket, "verification_result": result},
+        )
+
+    integration = _ticket_integration(record, batch)
+    integration_commit = _integration_commit(integration)
+    target_branch = str(integration.get("target_branch", "")) if integration else ""
+    verification_head = (
+        verification.get("target_head") if verification is not None else None
+    )
+    if (
+        integration_commit is None
+        or not target_branch
+        or not isinstance(verification_head, str)
+        or not verification_head
+    ):
+        raise BatchPlanError(
+            "cleanup requires complete integration and verification evidence",
+            error_code="batch_state_corrupt",
+            details={"ticket": ticket},
+        )
+
+    expected_target = str(batch.get("target_branch", ""))
+    if (
+        target_branch != expected_target
+        or verification.get("target_branch") != target_branch
+    ):
+        raise BatchPlanError(
+            "cleanup evidence target branch does not match the batch plan",
+            error_code="target_branch_mismatch",
+            details={
+                "ticket": ticket,
+                "expected_branch": expected_target,
+                "integration_branch": target_branch,
+                "verification_branch": verification.get("target_branch"),
+            },
+        )
+
+    repo = resolve_repo(str(ticket_state["repo"]))
+    target_head = run_git(repo, "rev-parse", target_branch)
+    if not is_ancestor(repo, integration_commit, target_head):
+        raise BatchPlanError(
+            "integrated commit is not an ancestor of the cleanup target HEAD",
+            error_code="integration_not_ancestor",
+            details={
+                "ticket": ticket,
+                "integration_commit": integration_commit,
+                "target_branch": target_branch,
+                "target_head": target_head,
+            },
+        )
+    if not is_ancestor(repo, verification_head, target_head):
+        raise BatchPlanError(
+            "verification target HEAD is not an ancestor of the cleanup target HEAD",
+            error_code="verification_target_not_ancestor",
+            details={
+                "ticket": ticket,
+                "verification_target_head": verification_head,
+                "target_branch": target_branch,
+                "target_head": target_head,
+            },
+        )
+
+
 def cleanup_boundary(state_arg: str) -> dict[str, object]:
     state_path, state = load_state(state_arg)
     if state.get("status") != "integrated":
         raise RuntimeError("only an integrated ticket can be cleaned up")
+    _require_cleanup_verification(state)
 
     main_repo = resolve_repo(str(state["repo"]))
     target_branch = str(state["integrated_into"])
@@ -1142,7 +2130,56 @@ def cleanup_boundary(state_arg: str) -> dict[str, object]:
 
     state.update({"status": "cleaned", "worktree_removed": True, "branch_removed": True})
     write_state(state_path, state)
+    _persist_batch_ticket_state(state, status="cleaned")
     return state
+
+
+def _cli_failure_details(args: argparse.Namespace) -> dict[str, object]:
+    """Provide a stable lifecycle failure shape even for unexpected errors."""
+
+    details: dict[str, object] = {
+        "ticket": getattr(args, "ticket", None),
+        "status": None,
+        "unmet_predecessors": [],
+        "gates": [],
+        "target_head": None,
+    }
+
+    state_arg = getattr(args, "state", None)
+    if state_arg:
+        try:
+            _, ticket_state = load_state(str(state_arg))
+            details["ticket"] = ticket_state.get("ticket", details["ticket"])
+            details["status"] = ticket_state.get("status")
+            repo_value = ticket_state.get("repo")
+            if repo_value:
+                repo = resolve_repo(str(repo_value))
+                branch = ticket_state.get(
+                    "target_branch", ticket_state.get("integrated_into", ticket_state.get("base_branch"))
+                )
+                details["target_head"] = run_git(
+                    repo, "rev-parse", str(branch) if branch else "HEAD"
+                )
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+
+    batch_arg = getattr(args, "batch_state", None)
+    if batch_arg:
+        try:
+            _, batch = load_batch_state(str(batch_arg))
+            ticket = details["ticket"]
+            if ticket:
+                record = _find_batch_ticket(batch, str(ticket))
+                if record is not None:
+                    details["status"] = record["status"]
+                    details["unmet_predecessors"] = list(record["dependencies"])
+            repo_value = batch.get("repo")
+            if repo_value:
+                details["target_head"] = run_git(Path(str(repo_value)), "rev-parse", "HEAD")
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+
+    return details
 
 
 def main() -> int:
@@ -1196,6 +2233,29 @@ def main() -> int:
     integrate_parser.add_argument("--target-branch")
     integrate_parser.add_argument("--continue", dest="continue_integration", action="store_true")
 
+    verify_parser = subparsers.add_parser(
+        "verify",
+        aliases=("record-verification", "verification"),
+        help="record the parent's explicit required-check result",
+    )
+    verify_parser.add_argument("--state", help="ticket lifecycle state path")
+    verify_parser.add_argument("--batch-state", help="validated batch state path")
+    verify_parser.add_argument("--ticket", help="ticket identity when using --batch-state")
+    verify_parser.add_argument(
+        "--result",
+        "--status",
+        "--verification-result",
+        dest="verification_result",
+        choices=tuple(sorted(VERIFICATION_RESULTS)),
+        required=True,
+    )
+    verify_parser.add_argument(
+        "--checks-json",
+        "--checks",
+        dest="checks",
+        help="optional JSON object mapping required check names to their observed result",
+    )
+
     cleanup_parser = subparsers.add_parser("cleanup")
     cleanup_parser.add_argument("--state", required=True)
 
@@ -1229,23 +2289,67 @@ def main() -> int:
                 target_branch=args.target_branch,
                 continue_integration=args.continue_integration,
             )
+        elif args.command in {"verify", "record-verification", "verification"}:
+            verification_state = args.state
+            if verification_state is None:
+                if not args.batch_state or not args.ticket:
+                    raise BatchPlanError(
+                        "verification requires --state or --batch-state with --ticket",
+                        error_code="verification_invalid",
+                    )
+                _, batch = load_batch_state(args.batch_state)
+                ticket_states = batch.get("ticket_states")
+                if not isinstance(ticket_states, dict) or args.ticket not in ticket_states:
+                    raise BatchPlanError(
+                        f"ticket state does not exist in batch state: {args.ticket}",
+                        error_code="ticket_unknown",
+                    )
+                ticket_state = ticket_states[args.ticket]
+                if not isinstance(ticket_state, dict) or not ticket_state.get("state_path"):
+                    raise BatchPlanError(
+                        f"ticket state path is missing for batch ticket: {args.ticket}",
+                        error_code="batch_state_corrupt",
+                    )
+                verification_state = str(ticket_state["state_path"])
+            if verification_state is None:
+                raise BatchPlanError(
+                    "verification state path is missing",
+                    error_code="verification_invalid",
+                )
+            result = record_verification(
+                verification_state,
+                result=args.verification_result,
+                checks=args.checks,
+            )
         else:
             result = cleanup_boundary(args.state)
     except BatchPlanError as error:
+        details = _cli_failure_details(args)
+        details.update(error.details)
         print(
             json.dumps(
                 {
                     "verified": False,
                     "error": str(error),
                     "error_code": error.error_code,
-                    "details": error.details,
+                    "details": details,
                 }
             ),
             file=sys.stderr,
         )
         return 1
-    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
-        print(json.dumps({"verified": False, "error": str(error)}), file=sys.stderr)
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+        print(
+            json.dumps(
+                {
+                    "verified": False,
+                    "error": str(error),
+                    "error_code": "lifecycle_error",
+                    "details": _cli_failure_details(args),
+                }
+            ),
+            file=sys.stderr,
+        )
         return 1
 
     print(json.dumps(result, indent=2))
