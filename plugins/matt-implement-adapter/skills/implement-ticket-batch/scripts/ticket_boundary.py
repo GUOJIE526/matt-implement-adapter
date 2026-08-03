@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -463,6 +464,80 @@ def _validate_evidence_maps(
                 )
 
 
+def _validate_legacy_imports(state: dict[str, object], identities: set[str]) -> None:
+    value = state.get("legacy_imports")
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise BatchPlanError("legacy_imports must be a JSON object", error_code="batch_state_corrupt")
+    unknown = sorted(str(ticket) for ticket in value if ticket not in identities)
+    if unknown:
+        raise BatchPlanError(
+            "legacy_imports contains an unknown ticket",
+            error_code="batch_state_corrupt",
+            details={"unknown_tickets": unknown},
+        )
+    for ticket, evidence in value.items():
+        if not isinstance(evidence, dict):
+            raise BatchPlanError(
+                f"legacy import evidence for ticket {ticket!r} must be a JSON object",
+                error_code="batch_state_corrupt",
+            )
+        for field in (
+            "state_path",
+            "schema_version",
+            "status",
+            "repo",
+            "target_branch",
+            "ticket",
+            "worker_branch",
+            "start_sha",
+        ):
+            if field not in evidence:
+                raise BatchPlanError(
+                    f"legacy import evidence for ticket {ticket!r} is incomplete",
+                    error_code="batch_state_corrupt",
+                    details={"ticket": ticket, "missing_field": field},
+                )
+        if evidence.get("ticket") != ticket or evidence.get("schema_version") != STATE_SCHEMA_VERSION:
+            raise BatchPlanError(
+                f"legacy import evidence identity/schema is invalid for ticket {ticket!r}",
+                error_code="batch_state_corrupt",
+                details={"ticket": ticket},
+            )
+        for field in ("state_path", "repo", "target_branch", "ticket", "worker_branch", "start_sha"):
+            if not isinstance(evidence.get(field), str) or not str(evidence[field]).strip():
+                raise BatchPlanError(
+                    f"legacy import evidence field {field!r} is invalid for ticket {ticket!r}",
+                    error_code="batch_state_corrupt",
+                    details={"ticket": ticket, "field": field},
+                )
+        if evidence.get("status") not in TICKET_STATUSES:
+            raise BatchPlanError(
+                f"legacy import evidence status is unsupported for ticket {ticket!r}",
+                error_code="batch_state_corrupt",
+                details={"ticket": ticket, "status": evidence.get("status")},
+            )
+        status = str(evidence["status"])
+        if status in {"finished", "integrated", "cleaned"} and (
+            not isinstance(evidence.get("final_sha"), str)
+            or not str(evidence.get("final_sha", "")).strip()
+        ):
+            raise BatchPlanError(
+                f"legacy import evidence is missing final commit for ticket {ticket!r}",
+                error_code="batch_state_corrupt",
+                details={"ticket": ticket},
+            )
+        if status in {"integrated", "cleaned"} and not isinstance(
+            evidence.get("integration"), dict
+        ):
+            raise BatchPlanError(
+                f"legacy import evidence is missing integration for ticket {ticket!r}",
+                error_code="batch_state_corrupt",
+                details={"ticket": ticket},
+            )
+
+
 def _validate_mirrored_evidence(
     state: dict[str, object], records: list[BatchTicketRecord]
 ) -> None:
@@ -709,6 +784,7 @@ def validate_batch_plan(state: dict[str, object]) -> None:
     for ticket, values in checks.items():
         _string_list(values, "required_checks", str(ticket))
     _validate_evidence_maps(state, identities)
+    _validate_legacy_imports(state, identities)
     for record in records:
         _validate_ticket_evidence(record, list(checks[str(record["ticket"])]))
     verifications = state.get("verifications")
@@ -1395,6 +1471,553 @@ def load_state(state_arg: str) -> tuple[Path, dict[str, object]]:
     return state_path, state
 
 
+def _load_legacy_state(state_arg: str) -> tuple[Path, dict[str, object]]:
+    """Load a pre-batch lifecycle state without mutating it."""
+
+    state_path = Path(state_arg).expanduser().resolve()
+    if not state_path.exists():
+        raise BatchPlanError(
+            f"legacy state does not exist: {state_path}",
+            error_code="legacy_state_missing",
+            details={"state_path": str(state_path)},
+        )
+    try:
+        document = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BatchPlanError(
+            f"legacy state is corrupted: {state_path}",
+            error_code="legacy_state_corrupt",
+            details={"state_path": str(state_path), "reason": str(error)},
+        ) from error
+    if not isinstance(document, dict):
+        raise BatchPlanError(
+            "legacy state root must be a JSON object",
+            error_code="legacy_state_corrupt",
+            details={"state_path": str(state_path)},
+        )
+    if document.get("schema_version") != STATE_SCHEMA_VERSION:
+        raise BatchPlanError(
+            "legacy state schema version is unsupported",
+            error_code="legacy_state_unsupported_schema",
+            details={"schema_version": document.get("schema_version")},
+        )
+    for field in ("repo", "ticket", "base_branch", "branch", "start_sha", "status"):
+        if not isinstance(document.get(field), str) or not str(document[field]).strip():
+            raise BatchPlanError(
+                f"legacy state is missing required field: {field}",
+                error_code="legacy_state_corrupt",
+                details={"state_path": str(state_path), "field": field},
+            )
+    status = str(document["status"])
+    if status not in {"started", "finished", "integrated"}:
+        raise BatchPlanError(
+            f"legacy state status cannot be imported: {status}",
+            error_code="legacy_state_corrupt",
+            details={"state_path": str(state_path), "status": status},
+        )
+    document["state_path"] = str(state_path)
+    return state_path, cast(dict[str, object], document)
+
+
+def _legacy_commit(repo: Path, value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise BatchPlanError(
+            f"legacy state is missing {field} commit evidence",
+            error_code="legacy_evidence_invalid",
+            details={"field": field},
+        )
+    try:
+        return run_git(repo, "rev-parse", "--verify", f"{value}^{{commit}}")
+    except RuntimeError as error:
+        raise BatchPlanError(
+            f"legacy {field} is not a valid commit: {value}",
+            error_code="legacy_evidence_invalid",
+            details={"field": field, "value": value},
+        ) from error
+
+
+def _commit_patch_id(repo: Path, commit: str) -> str | None:
+    shown = subprocess.run(
+        ["git", "-C", str(repo), "show", "--format=", "--no-ext-diff", commit],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if shown.returncode != 0:
+        return None
+    patch = subprocess.run(
+        ["git", "patch-id", "--stable"],
+        input=shown.stdout,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if patch.returncode != 0 or not patch.stdout.strip():
+        return None
+    return patch.stdout.split()[0]
+
+
+def _git_common_dir(path: Path) -> Path:
+    value = Path(run_git(path, "rev-parse", "--git-common-dir"))
+    return (value if value.is_absolute() else path / value).resolve()
+
+
+def _legacy_worker_evidence(
+    repo: Path, state: dict[str, object]
+) -> tuple[str, str | None]:
+    """Validate the legacy worker ref and final commit evidence."""
+
+    branch = str(state["branch"])
+    try:
+        run_git(repo, "check-ref-format", "--branch", branch)
+        worker_head = _legacy_commit(
+            repo,
+            run_git(repo, "rev-parse", f"refs/heads/{branch}"),
+            "worker",
+        )
+    except BatchPlanError:
+        raise
+    except RuntimeError as error:
+        raise BatchPlanError(
+            f"legacy worker branch is invalid or missing: {branch}",
+            error_code="legacy_evidence_invalid",
+            details={"branch": branch},
+        ) from error
+    start_sha = _legacy_commit(repo, state.get("start_sha"), "start")
+    status = str(state["status"])
+    worktree_value = state.get("worktree")
+    if not isinstance(worktree_value, str) or not worktree_value.strip():
+        raise BatchPlanError(
+            "legacy state is missing worker worktree evidence",
+            error_code="legacy_evidence_invalid",
+        )
+    worktree = Path(worktree_value).expanduser().resolve()
+    if not worktree.exists():
+        raise BatchPlanError(
+            f"legacy worker worktree does not exist: {worktree}",
+            error_code="legacy_evidence_invalid",
+            details={"worktree": str(worktree)},
+        )
+    try:
+        if _git_common_dir(worktree) != _git_common_dir(repo) or run_git(worktree, "branch", "--show-current") != branch:
+            raise BatchPlanError(
+                "legacy worker worktree does not match its repository or branch",
+                error_code="legacy_evidence_invalid",
+                details={"worktree": str(worktree), "branch": branch},
+            )
+    except BatchPlanError:
+        raise
+    except RuntimeError as error:
+        raise BatchPlanError(
+            "legacy worker worktree is not a valid Git worktree",
+            error_code="legacy_evidence_invalid",
+            details={"worktree": str(worktree)},
+        ) from error
+    if status in {"finished", "integrated"}:
+        try:
+            require_clean(worktree)
+        except RuntimeError as error:
+            raise BatchPlanError(
+                "legacy finished worker worktree is not clean",
+                error_code="legacy_evidence_invalid",
+                details={"worktree": str(worktree)},
+            ) from error
+        final_sha = _legacy_commit(repo, state.get("final_sha"), "final")
+        if worker_head != final_sha:
+            raise BatchPlanError(
+                "legacy worker branch does not point at final commit",
+                error_code="legacy_ancestry_mismatch",
+                details={"worker_head": worker_head, "final_sha": final_sha},
+            )
+        if not is_ancestor(repo, start_sha, final_sha):
+            raise BatchPlanError(
+                "legacy start commit is not an ancestor of final commit",
+                error_code="legacy_ancestry_mismatch",
+                details={"start_sha": start_sha, "final_sha": final_sha},
+            )
+        commit_count = int(run_git(repo, "rev-list", "--count", f"{start_sha}..{final_sha}"))
+        if commit_count != 1:
+            raise BatchPlanError(
+                "legacy worker does not contain exactly one final commit",
+                error_code="legacy_evidence_invalid",
+                details={"commit_count": commit_count},
+            )
+        changed_files = [
+            line
+            for line in run_git(repo, "diff", "--name-only", f"{start_sha}..{final_sha}").splitlines()
+            if line
+        ]
+        if not changed_files:
+            raise BatchPlanError(
+                "legacy final commit contains no changed files",
+                error_code="legacy_evidence_invalid",
+            )
+        return start_sha, final_sha
+    if worker_head != start_sha:
+        raise BatchPlanError(
+            "legacy started worker branch moved beyond its start commit",
+            error_code="legacy_ancestry_mismatch",
+            details={"worker_head": worker_head, "start_sha": start_sha},
+        )
+    return start_sha, None
+
+
+def _legacy_integration_evidence(
+    repo: Path,
+    state: dict[str, object],
+    *,
+    target_branch: str,
+    start_sha: str,
+    final_sha: str,
+) -> tuple[IntegrationEvidence, str]:
+    """Validate the old integration commit and target ancestry."""
+
+    integration_value = state.get("integration")
+    integration = integration_value if isinstance(integration_value, dict) else {}
+    strategy = state.get("integration_strategy", integration.get("strategy"))
+    integrated_branch = state.get("integrated_into", integration.get("target_branch"))
+    commit_value = state.get(
+        "integration_sha",
+        state.get("integrated_commit", integration.get("commit")),
+    )
+    if integrated_branch != target_branch:
+        raise BatchPlanError(
+            "legacy integration target branch does not match the batch plan",
+            error_code="legacy_target_mismatch",
+            details={"expected_branch": target_branch, "actual_branch": integrated_branch},
+        )
+    if strategy not in {"merge", "cherry-pick"}:
+        raise BatchPlanError(
+            "legacy integration strategy is unsupported",
+            error_code="legacy_evidence_invalid",
+            details={"strategy": strategy},
+        )
+    integration_sha = _legacy_commit(repo, commit_value, "integration")
+    integration_start = _legacy_commit(
+        repo,
+        state.get("integration_start_sha", start_sha),
+        "integration start",
+    )
+    target_head = _legacy_commit(
+        repo,
+        run_git(repo, "rev-parse", f"refs/heads/{target_branch}"),
+        "target",
+    )
+    if not is_ancestor(repo, integration_start, integration_sha):
+        raise BatchPlanError(
+            "legacy integration commit is not based on its recorded target start",
+            error_code="legacy_ancestry_mismatch",
+            details={"integration_start_sha": integration_start, "integration_sha": integration_sha},
+        )
+    if not is_ancestor(repo, integration_sha, target_head):
+        raise BatchPlanError(
+            "legacy integration commit is not an ancestor of the target branch",
+            error_code="legacy_ancestry_mismatch",
+            details={"integration_sha": integration_sha, "target_head": target_head},
+        )
+    if strategy == "merge" and not is_ancestor(repo, final_sha, integration_sha):
+        raise BatchPlanError(
+            "legacy merge integration does not contain the worker final commit",
+            error_code="legacy_ancestry_mismatch",
+            details={"final_sha": final_sha, "integration_sha": integration_sha},
+        )
+    if strategy == "cherry-pick" and integration_sha == integration_start:
+        raise BatchPlanError(
+            "legacy cherry-pick integration does not contain a new integration commit",
+            error_code="legacy_ancestry_mismatch",
+            details={"integration_start_sha": integration_start, "integration_sha": integration_sha},
+        )
+    if strategy == "cherry-pick":
+        worker_patch = _commit_patch_id(repo, final_sha)
+        integrated_patch = _commit_patch_id(repo, integration_sha)
+        if worker_patch is None or integrated_patch is None or worker_patch != integrated_patch:
+            raise BatchPlanError(
+                "legacy cherry-pick integration does not match the worker final commit",
+                error_code="legacy_ancestry_mismatch",
+                details={"final_sha": final_sha, "integration_sha": integration_sha},
+            )
+    evidence: IntegrationEvidence = {
+        "target_branch": target_branch,
+        "strategy": str(strategy),
+        "commit": integration_sha,
+        "integrated_commit": integration_sha,
+        "integration_sha": integration_sha,
+    }
+    return evidence, target_head
+
+
+def import_legacy_state(
+    repo_arg: str,
+    batch_state_arg: str,
+    legacy_state_arg: str,
+    *,
+    ticket: str | None = None,
+    result: str | None = None,
+    checks: object = None,
+) -> dict[str, object]:
+    """Import one pre-batch lifecycle state into an authoritative batch plan."""
+
+    legacy_path, legacy_state = _load_legacy_state(legacy_state_arg)
+    main_repo = resolve_repo(repo_arg)
+    expected_repo = Path(str(legacy_state["repo"])).expanduser().resolve()
+    if main_repo != expected_repo:
+        raise BatchPlanError(
+            "legacy state repository does not match the requested repository",
+            error_code="legacy_repository_mismatch",
+            details={"expected_repo": str(expected_repo), "actual_repo": str(main_repo)},
+        )
+    require_clean(main_repo)
+    actual_ticket = str(legacy_state["ticket"])
+    if ticket is not None and ticket != actual_ticket:
+        raise BatchPlanError(
+            "legacy state ticket identity does not match the requested ticket",
+            error_code="legacy_ticket_mismatch",
+            details={"state_ticket": actual_ticket, "requested_ticket": ticket},
+        )
+    start_sha, final_sha = _legacy_worker_evidence(main_repo, legacy_state)
+
+    batch_path = Path(batch_state_arg).expanduser().resolve()
+    with batch_state_lock(batch_path):
+        batch = _load_batch_state_unlocked(batch_path)
+        batch["state_path"] = str(batch_path)
+        if Path(str(batch["repo"])).expanduser().resolve() != main_repo:
+            raise BatchPlanError(
+                "batch plan repository does not match the requested repository",
+                error_code="target_repository_mismatch",
+                details={"batch_repo": batch.get("repo"), "actual_repo": str(main_repo)},
+            )
+        expected_branch = str(batch["target_branch"])
+        if str(legacy_state["base_branch"]) != expected_branch:
+            raise BatchPlanError(
+                "legacy state target branch does not match the batch plan",
+                error_code="legacy_target_mismatch",
+                details={"expected_branch": expected_branch, "actual_branch": legacy_state["base_branch"]},
+            )
+        batch_start_sha = _legacy_commit(main_repo, batch.get("starting_sha"), "batch start")
+        if not is_ancestor(main_repo, start_sha, batch_start_sha):
+            raise BatchPlanError(
+                "legacy worker start commit is not an ancestor of the batch starting SHA",
+                error_code="legacy_ancestry_mismatch",
+                details={"legacy_start_sha": start_sha, "batch_starting_sha": batch_start_sha},
+            )
+        record = _find_batch_ticket(batch, actual_ticket)
+        if record is None:
+            raise BatchPlanError(
+                f"ticket is not present in the batch plan: {actual_ticket}",
+                error_code="ticket_unknown",
+            )
+        existing_imports = batch.get("legacy_imports")
+        already_imported = (
+            isinstance(existing_imports, dict)
+            and actual_ticket in existing_imports
+            and str(record["status"]) == str(legacy_state["status"])
+        )
+        if str(record["status"]) not in RUNNABLE_STATUSES and not already_imported:
+            raise BatchPlanError(
+                f"ticket is already claimed in the batch plan: {actual_ticket}",
+                error_code="ticket_already_started",
+                details={"ticket": actual_ticket, "status": record["status"]},
+            )
+        unmet, gates, _ = _predecessor_evidence(main_repo, batch, actual_ticket, start_sha)
+        if unmet or gates:
+            raise BatchPlanError(
+                "legacy worker start does not contain validated predecessor evidence",
+                error_code="legacy_ancestry_mismatch",
+                details={
+                    "ticket": actual_ticket,
+                    "unmet_predecessors": unmet,
+                    "gates": gates,
+                    "start_sha": start_sha,
+                },
+            )
+
+        integration: IntegrationEvidence | None = None
+        if (
+            run_git_process(
+                main_repo,
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{expected_branch}",
+            ).returncode
+            != 0
+        ):
+            raise BatchPlanError(
+                f"batch target branch does not exist: {expected_branch}",
+                error_code="legacy_target_mismatch",
+                details={"target_branch": expected_branch},
+            )
+        target_head = run_git(main_repo, "rev-parse", f"refs/heads/{expected_branch}")
+        if str(legacy_state["status"]) == "integrated":
+            if final_sha is None:
+                raise BatchPlanError(
+                    "legacy integrated state is missing final commit evidence",
+                    error_code="legacy_evidence_invalid",
+                )
+            integration, target_head = _legacy_integration_evidence(
+                main_repo,
+                legacy_state,
+                target_branch=expected_branch,
+                start_sha=start_sha,
+                final_sha=final_sha,
+            )
+
+        verification: VerificationEvidence | None = None
+        required_checks_map = batch.get("required_checks")
+        if not isinstance(required_checks_map, dict):
+            raise BatchPlanError(
+                "required_checks must map every ticket identity exactly once",
+                error_code="batch_state_corrupt",
+            )
+        required_checks = list(required_checks_map.get(actual_ticket, []))
+        if result is not None:
+            if str(legacy_state["status"]) != "integrated" or integration is None:
+                raise BatchPlanError(
+                    "legacy verification requires a successfully integrated state",
+                    error_code="verification_not_ready",
+                    details={"ticket": actual_ticket, "status": legacy_state["status"]},
+                )
+            if result not in VERIFICATION_RESULTS:
+                raise BatchPlanError(
+                    "legacy verification result must be 'passed' or 'failed'",
+                    error_code="verification_invalid",
+                    details={"result": result},
+                )
+            check_results = _parse_check_results(checks, required_checks, result=result)
+            verification = {
+                "result": result,
+                "status": result,
+                "required_checks": required_checks,
+                "checks": check_results,
+                "target_branch": expected_branch,
+                "target_head": target_head,
+            }
+
+        original_batch = deepcopy(batch)
+        original_legacy = deepcopy(legacy_state)
+        status = str(legacy_state["status"])
+        record["status"] = cast(TicketStatus, status)
+        if integration is not None:
+            record["integration"] = integration
+            record["integration_target_branch"] = expected_branch
+            record["integration_strategy"] = integration["strategy"]
+            record["integrated_commit"] = integration["commit"]
+            integrations = batch.setdefault("integrations", {})
+            if not isinstance(integrations, dict):
+                raise BatchPlanError("integrations must be a JSON object", error_code="batch_state_corrupt")
+            integrations[actual_ticket] = integration
+        if verification is not None:
+            record["verification"] = verification
+            verifications = batch.setdefault("verifications", {})
+            if not isinstance(verifications, dict):
+                raise BatchPlanError("verifications must be a JSON object", error_code="batch_state_corrupt")
+            verifications[actual_ticket] = verification
+
+        legacy_imports = batch.setdefault("legacy_imports", {})
+        if not isinstance(legacy_imports, dict):
+            raise BatchPlanError("legacy_imports must be a JSON object", error_code="batch_state_corrupt")
+        legacy_imports[actual_ticket] = {
+            "state_path": str(legacy_path),
+            "schema_version": legacy_state["schema_version"],
+            "status": status,
+            "repo": str(main_repo),
+            "target_branch": expected_branch,
+            "ticket": actual_ticket,
+            "worker_branch": legacy_state["branch"],
+            "start_sha": start_sha,
+            "final_sha": final_sha,
+            "integration": integration,
+            "verification": verification,
+        }
+
+        ticket_states = batch.setdefault("ticket_states", {})
+        if not isinstance(ticket_states, dict):
+            raise BatchPlanError("ticket_states must be a JSON object", error_code="batch_state_corrupt")
+        mirrored = dict(legacy_state)
+        mirrored.update(
+            {
+                "batch_state": str(batch_path),
+                "batch_state_path": str(batch_path),
+                "batch_id": batch["batch_id"],
+                "legacy_imported": True,
+                "status": status,
+            }
+        )
+        if integration is not None:
+            mirrored["integration"] = integration
+        if verification is not None:
+            mirrored["verification"] = verification
+            mirrored["verification_result"] = result
+            mirrored["verification_target_head"] = target_head
+        ticket_states[actual_ticket] = mirrored
+
+        if (
+            status in SATISFIED_PREDECESSOR_STATUSES
+            and verification is not None
+            and result == "passed"
+        ):
+            generation_tickets = _frontier_generation_tickets(batch)
+            if (
+                actual_ticket in generation_tickets
+                and _frontier_generation_is_complete(batch, generation_tickets)
+            ):
+                batch["frontier_sha"] = target_head
+                batch["frontier_generation"] = int(batch.get("frontier_generation", 0)) + 1
+                next_frontier = _calculate_frontier(batch)
+                batch["frontier_tickets"] = list(next_frontier["frontier"])
+        next_frontier = _calculate_frontier(batch)
+        batch["frontier"] = list(next_frontier["frontier"])
+        batch["runnable"] = list(next_frontier["runnable"])
+        validate_batch_plan(batch)
+        _atomic_write_json(batch_path, batch)
+
+        try:
+            legacy_state.update(
+                {
+                    "batch_state": str(batch_path),
+                    "batch_state_path": str(batch_path),
+                    "batch_id": batch["batch_id"],
+                    "legacy_imported": True,
+                }
+            )
+            if integration is not None:
+                legacy_state["integration"] = integration
+            if verification is not None:
+                legacy_state.update(
+                    {
+                        "verification": verification,
+                        "verification_result": result,
+                        "verification_target_head": target_head,
+                    }
+                )
+            write_state(legacy_path, legacy_state)
+        except (OSError, TypeError, ValueError):
+            _atomic_write_json(batch_path, original_batch)
+            legacy_state.clear()
+            legacy_state.update(original_legacy)
+            raise
+
+    return {
+        **next_frontier,
+        "verified": True,
+        "imported": True,
+        "legacy": True,
+        "ticket": actual_ticket,
+        "status": status,
+        "state_path": str(legacy_path),
+        "legacy_state_path": str(legacy_path),
+        "batch_state": str(batch_path),
+        "batch_state_path": str(batch_path),
+        "batch_id": batch["batch_id"],
+        "verification": verification,
+        "integration": integration,
+        "verification_result": result,
+        "integration_sha": integration.get("commit") if integration is not None else None,
+    }
+
+
 def ticket_slug(ticket: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", ticket).strip("-.")
     return slug[:48] or "ticket"
@@ -2039,6 +2662,11 @@ def _require_cleanup_verification(ticket_state: dict[str, object]) -> None:
         if verification is not None
         else None
     )
+    if ticket_state.get("legacy_imported") and result != "passed":
+        # A pre-batch ticket keeps its original finish/integrate/cleanup
+        # contract.  Missing or failed imported verification blocks new
+        # dependents, but must not strand the legacy worker resources.
+        return
     if record is None or str(record["status"]) != "integrated" or result != "passed":
         raise BatchPlanError(
             "cleanup requires integration and an explicit passed verification result",
@@ -2145,7 +2773,7 @@ def _cli_failure_details(args: argparse.Namespace) -> dict[str, object]:
         "target_head": None,
     }
 
-    state_arg = getattr(args, "state", None)
+    state_arg = getattr(args, "state", None) or getattr(args, "legacy_state", None)
     if state_arg:
         try:
             _, ticket_state = load_state(str(state_arg))
@@ -2182,6 +2810,25 @@ def _cli_failure_details(args: argparse.Namespace) -> dict[str, object]:
     return details
 
 
+def _add_legacy_import_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--batch-state", required=True)
+    parser.add_argument("--state", "--legacy-state", dest="legacy_state", required=True)
+    parser.add_argument("--ticket")
+    parser.add_argument(
+        "--result",
+        "--verification-result",
+        dest="verification_result",
+        choices=tuple(sorted(VERIFICATION_RESULTS)),
+    )
+    parser.add_argument(
+        "--checks-json",
+        "--checks",
+        dest="checks",
+        help="optional JSON object mapping required check names to their observed result",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -2211,6 +2858,12 @@ def main() -> int:
         "frontier", aliases=("query", "show", "load"), help="query the current runnable frontier"
     )
     plan_frontier_parser.add_argument("--state", required=True)
+
+    plan_import_parser = plan_subparsers.add_parser(
+        "import", aliases=("legacy-import", "recover", "migrate"),
+        help="validate and import a pre-batch lifecycle state",
+    )
+    _add_legacy_import_arguments(plan_import_parser)
 
     start_parser = subparsers.add_parser("start")
     start_parser.add_argument("--repo", required=True)
@@ -2259,6 +2912,21 @@ def main() -> int:
     cleanup_parser = subparsers.add_parser("cleanup")
     cleanup_parser.add_argument("--state", required=True)
 
+    legacy_parser = subparsers.add_parser(
+        "legacy", help="import one pre-batch lifecycle state into a validated batch plan"
+    )
+    legacy_subparsers = legacy_parser.add_subparsers(dest="legacy_command", required=True)
+    legacy_import_parser = legacy_subparsers.add_parser(
+        "import", aliases=("recover", "migrate"), help="validate and import a legacy state"
+    )
+    _add_legacy_import_arguments(legacy_import_parser)
+
+    direct_import_parser = subparsers.add_parser(
+        "import", aliases=("legacy-import", "recover", "migrate"),
+        help="validate and import a pre-batch state (alias for legacy import)",
+    )
+    _add_legacy_import_arguments(direct_import_parser)
+
     args = parser.parse_args()
     try:
         if args.command in {"plan", "batch-plan"}:
@@ -2269,6 +2937,15 @@ def main() -> int:
                     target_branch=args.target_branch,
                     starting_sha=args.starting_sha,
                     tickets=_read_tickets_argument(args.tickets),
+                )
+            elif args.plan_command in {"import", "legacy-import", "recover", "migrate"}:
+                result = import_legacy_state(
+                    args.repo,
+                    args.batch_state,
+                    args.legacy_state,
+                    ticket=args.ticket,
+                    result=args.verification_result,
+                    checks=args.checks,
                 )
             else:
                 result = query_batch_frontier(args.state)
@@ -2318,6 +2995,24 @@ def main() -> int:
                 )
             result = record_verification(
                 verification_state,
+                result=args.verification_result,
+                checks=args.checks,
+            )
+        elif args.command == "legacy":
+            result = import_legacy_state(
+                args.repo,
+                args.batch_state,
+                args.legacy_state,
+                ticket=args.ticket,
+                result=args.verification_result,
+                checks=args.checks,
+            )
+        elif args.command in {"import", "legacy-import", "recover", "migrate"}:
+            result = import_legacy_state(
+                args.repo,
+                args.batch_state,
+                args.legacy_state,
+                ticket=args.ticket,
                 result=args.verification_result,
                 checks=args.checks,
             )
