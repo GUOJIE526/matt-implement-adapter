@@ -371,6 +371,23 @@ def _require_batch_size(records: list[BatchTicketRecord]) -> None:
         )
 
 
+def _validate_worktree_slugs(records: list[BatchTicketRecord]) -> None:
+    by_slug: dict[str, list[str]] = {}
+    for record in records:
+        ticket = str(record["ticket"])
+        by_slug.setdefault(ticket_slug(ticket), []).append(ticket)
+    collisions = {
+        slug: sorted(tickets)
+        for slug, tickets in by_slug.items()
+        if len(tickets) > 1
+    }
+    if collisions:
+        raise BatchPlanError(
+            "ticket identities produce colliding worker worktree names",
+            details={"worktree_slug_collisions": collisions},
+        )
+
+
 def validate_batch_plan(state: dict[str, object]) -> None:
     if state.get("schema_version") != BATCH_PLAN_SCHEMA_VERSION:
         raise BatchPlanError(
@@ -380,7 +397,14 @@ def validate_batch_plan(state: dict[str, object]) -> None:
         )
     if state.get("kind") != BATCH_PLAN_KIND:
         raise BatchPlanError("state is not a batch plan", error_code="batch_state_corrupt")
-    for field in ("repo", "target_branch", "starting_sha", "tickets", "required_checks"):
+    for field in (
+        "repo",
+        "target_branch",
+        "starting_sha",
+        "batch_id",
+        "tickets",
+        "required_checks",
+    ):
         if field not in state:
             raise BatchPlanError(
                 f"batch plan is missing required field: {field}",
@@ -390,9 +414,22 @@ def validate_batch_plan(state: dict[str, object]) -> None:
         raise BatchPlanError("target_branch must be a non-empty string")
     if not isinstance(state["starting_sha"], str) or not state["starting_sha"]:
         raise BatchPlanError("starting_sha must be a non-empty string")
+    if "frontier_sha" in state and (
+        not isinstance(state["frontier_sha"], str) or not state["frontier_sha"]
+    ):
+        raise BatchPlanError(
+            "frontier_sha must be a non-empty string",
+            error_code="batch_state_corrupt",
+        )
+    if not isinstance(state["batch_id"], str) or not state["batch_id"]:
+        raise BatchPlanError(
+            "batch_id must be a non-empty string",
+            error_code="batch_state_corrupt",
+        )
     records = normalize_ticket_records(state["tickets"])
     _validate_dependency_graph(records)
     _require_batch_size(records)
+    _validate_worktree_slugs(records)
     state["tickets"] = records
     identities = {str(record["ticket"]) for record in records}
     checks = state["required_checks"]
@@ -411,6 +448,63 @@ def validate_batch_plan(state: dict[str, object]) -> None:
             "persisted frontier contains an unknown or invalid ticket",
             error_code="batch_state_corrupt",
         )
+    ticket_states = state.get("ticket_states")
+    if ticket_states is not None:
+        if not isinstance(ticket_states, dict):
+            raise BatchPlanError(
+                "ticket_states must be a JSON object",
+                error_code="batch_state_corrupt",
+            )
+        unknown_states = sorted(str(ticket) for ticket in ticket_states if ticket not in identities)
+        if unknown_states:
+            raise BatchPlanError(
+                "ticket_states contains an unknown ticket",
+                error_code="batch_state_corrupt",
+                details={"unknown_tickets": unknown_states},
+            )
+        for ticket, ticket_state in ticket_states.items():
+            if not isinstance(ticket_state, dict):
+                raise BatchPlanError(
+                    f"ticket state for {ticket!r} must be a JSON object",
+                    error_code="batch_state_corrupt",
+                )
+            ticket_state_identity = ticket_state.get("ticket")
+            if ticket_state_identity is not None and ticket_state_identity != ticket:
+                raise BatchPlanError(
+                    f"ticket state identity mismatch for {ticket!r}",
+                    error_code="batch_state_corrupt",
+                )
+            if ticket_state.get("batch_id") != state["batch_id"]:
+                raise BatchPlanError(
+                    f"ticket state batch identity mismatch for {ticket!r}",
+                    error_code="batch_state_corrupt",
+                    details={
+                        "ticket": ticket,
+                        "batch_id": ticket_state.get("batch_id"),
+                        "expected_batch_id": state["batch_id"],
+                    },
+                )
+            record = next(
+                record for record in records if record["ticket"] == ticket
+            )
+            record_status = str(record["status"])
+            ticket_status = ticket_state.get("status")
+            if record_status in RUNNABLE_STATUSES:
+                raise BatchPlanError(
+                    f"ticket state exists for runnable ticket {ticket!r}",
+                    error_code="batch_state_corrupt",
+                    details={"ticket": ticket, "status": record_status},
+                )
+            if ticket_status == "started" and record_status != "started":
+                raise BatchPlanError(
+                    f"ticket state status does not match batch ticket {ticket!r}",
+                    error_code="batch_state_corrupt",
+                    details={
+                        "ticket": ticket,
+                        "ticket_status": ticket_status,
+                        "batch_status": record_status,
+                    },
+                )
 
 
 def calculate_frontier(state: dict[str, object]) -> dict[str, object]:
@@ -526,6 +620,7 @@ def create_batch_plan(
     records = normalize_ticket_records(tickets)
     _validate_dependency_graph(records)
     _require_batch_size(records)
+    _validate_worktree_slugs(records)
     state_path = Path(state_arg).expanduser().resolve()
     required_checks = {
         str(record["ticket"]): list(record["required_checks"]) for record in records
@@ -543,6 +638,7 @@ def create_batch_plan(
         "state_path": str(state_path),
         "target_branch": branch,
         "starting_sha": resolved_start,
+        "frontier_sha": resolved_start,
         "tickets": records,
         "dependencies": {
             str(record["ticket"]): list(record["dependencies"]) for record in records
@@ -566,6 +662,118 @@ def query_batch_frontier(state_arg: str) -> dict[str, object]:
     state_path, state = load_batch_state(state_arg)
     state["state_path"] = str(state_path)
     return calculate_frontier(state)
+
+
+def _find_batch_ticket(state: dict[str, object], ticket: str) -> BatchTicketRecord | None:
+    records = state.get("tickets")
+    if not isinstance(records, list):
+        return None
+    for record in records:
+        if isinstance(record, dict) and record.get("ticket") == ticket:
+            return cast(BatchTicketRecord, record)
+    return None
+
+
+def _start_failure_details(
+    state: dict[str, object],
+    ticket: str,
+    *,
+    target_head: str | None = None,
+    status: str | None = None,
+    predecessors: list[str] | None = None,
+    gates: list[str] | None = None,
+    reason: str | None = None,
+) -> dict[str, object]:
+    record = _find_batch_ticket(state, ticket)
+    return {
+        "ticket": ticket,
+        "status": status if status is not None else str(record["status"]) if record else "unknown",
+        "unmet_predecessors": predecessors
+        if predecessors is not None
+        else list(record["dependencies"]) if record else [],
+        "gates": gates or [],
+        "target_head": target_head,
+        "target_branch": state.get("target_branch"),
+        "reason": reason or "ticket is not in the current runnable frontier",
+    }
+
+
+def _target_failure_details(
+    state: dict[str, object],
+    ticket: str | None,
+    *,
+    target_head: str | None,
+    **extra: object,
+) -> dict[str, object]:
+    details = (
+        _start_failure_details(state, ticket, target_head=target_head)
+        if ticket is not None
+        else {}
+    )
+    details.update(extra)
+    return details
+
+
+def _require_start_target(
+    repo: Path, state: dict[str, object], *, ticket: str | None = None
+) -> tuple[str, str]:
+    expected_repo = Path(str(state["repo"])).expanduser().resolve()
+    if repo != expected_repo:
+        raise BatchPlanError(
+            "start repository does not match the batch plan",
+            error_code="target_repository_mismatch",
+            details=_target_failure_details(
+                state,
+                ticket,
+                target_head=None,
+                expected_repo=str(expected_repo),
+                actual_repo=str(repo),
+            ),
+        )
+
+    expected_branch = str(state["target_branch"])
+    actual_branch = run_git(repo, "branch", "--show-current")
+    target_head = run_git(repo, "rev-parse", "HEAD")
+    if actual_branch != expected_branch:
+        raise BatchPlanError(
+            "target branch does not match the batch plan",
+            error_code="target_branch_mismatch",
+            details=_target_failure_details(
+                state,
+                ticket,
+                target_head=target_head,
+                expected_branch=expected_branch,
+                actual_branch=actual_branch,
+            ),
+        )
+
+    status = run_git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+    if status:
+        raise BatchPlanError(
+            "target worktree is not clean",
+            error_code="target_worktree_dirty",
+            details=_target_failure_details(
+                state,
+                ticket,
+                target_head=target_head,
+                target_branch=actual_branch,
+            ),
+        )
+
+    expected_head = str(state.get("frontier_sha", state["starting_sha"]))
+    if target_head != expected_head:
+        raise BatchPlanError(
+            "target HEAD changed after the batch frontier was frozen",
+            error_code="target_head_stale",
+            details=_target_failure_details(
+                state,
+                ticket,
+                target_head=target_head,
+                expected_head=expected_head,
+                target_branch=actual_branch,
+            ),
+        )
+    return actual_branch, target_head
 
 
 def load_state(state_arg: str) -> tuple[Path, dict[str, object]]:
@@ -595,71 +803,171 @@ def start_boundary(
     repo_arg: str,
     ticket: str,
     *,
+    batch_state: str | Path | None = None,
     worktree_root: str | Path | None = None,
     branch_name: str | None = None,
 ) -> dict[str, object]:
-    main_repo = resolve_repo(repo_arg)
-    require_clean(main_repo)
-    base_branch = run_git(main_repo, "branch", "--show-current")
-    if not base_branch:
-        raise RuntimeError("detached HEAD is not supported for a ticket batch")
-
-    start_sha = run_git(main_repo, "rev-parse", "HEAD")
-    token = uuid.uuid4().hex[:12]
-    slug = ticket_slug(ticket)
-    worker_branch = branch_name or f"codex/matt-ticket/{slug}-{token}"
-    run_git(main_repo, "check-ref-format", "--branch", worker_branch)
-    if (
-        run_git_process(
-            main_repo, "show-ref", "--verify", "--quiet", f"refs/heads/{worker_branch}"
-        ).returncode
-        == 0
-    ):
-        raise RuntimeError(f"worker branch already exists: {worker_branch}")
-
-    if worktree_root is None:
-        worktree_root_path = Path(tempfile.gettempdir()) / "matt-implement-adapter" / "worktrees"
-    else:
-        worktree_root_path = Path(worktree_root).expanduser().resolve()
-    worktree_root_path.mkdir(parents=True, exist_ok=True)
-    worktree_path = worktree_root_path / slug
-    if worktree_path.exists():
-        raise RuntimeError(f"worker worktree already exists: {worktree_path}")
-
-    state_dir = Path(tempfile.gettempdir()) / "matt-implement-adapter" / "states"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_path = state_dir / f"{uuid.uuid4().hex}.json"
-    state = {
-        "schema_version": STATE_SCHEMA_VERSION,
-        "repo": str(main_repo),
-        "worktree": str(worktree_path),
-        "ticket": ticket,
-        "base_branch": base_branch,
-        "branch": worker_branch,
-        "start_sha": start_sha,
-        "state_path": str(state_path),
-        "status": "started",
-    }
-
-    try:
-        run_git(
-            main_repo,
-            "worktree",
-            "add",
-            "-b",
-            worker_branch,
-            str(worktree_path),
-            start_sha,
+    if batch_state is None or not str(batch_state).strip():
+        raise BatchPlanError(
+            "multi-ticket start requires a validated batch state; create a batch plan first",
+            error_code="batch_state_missing",
+            details={
+                "guidance": (
+                    "Run `ticket_boundary.py plan create` with the complete approved ticket graph, "
+                    "or follow migration guidance to move existing lifecycle records into a batch plan, "
+                    "then retry start with --batch-state <path>."
+                )
+            },
         )
-        write_state(state_path, state)
-    except (OSError, RuntimeError):
-        if worktree_path.exists():
-            run_git(main_repo, "worktree", "remove", "--force", str(worktree_path), check=False)
-        run_git(main_repo, "branch", "-D", worker_branch, check=False)
-        state_path.unlink(missing_ok=True)
-        raise
 
-    return state
+    batch_state_path = Path(batch_state).expanduser().resolve()
+    if not batch_state_path.exists():
+        raise BatchPlanError(
+            f"batch state does not exist: {batch_state_path}",
+            error_code="batch_state_missing",
+            details={
+                "state_path": str(batch_state_path),
+                "guidance": (
+                    "Create a validated batch plan (or follow migration guidance for an existing lifecycle state) "
+                    "before starting any worker; "
+                    "do not resume a multi-ticket start without batch state."
+                ),
+            },
+        )
+
+    with batch_state_lock(batch_state_path):
+        state = _load_batch_state_unlocked(batch_state_path)
+        state["state_path"] = str(batch_state_path)
+        main_repo = resolve_repo(repo_arg)
+        base_branch, start_sha = _require_start_target(main_repo, state, ticket=ticket)
+
+        record = _find_batch_ticket(state, ticket)
+        frontier = _calculate_frontier(state)
+        runnable = [str(item) for item in frontier["frontier"]]
+        if record is None:
+            raise BatchPlanError(
+                f"ticket is not present in the batch plan: {ticket}",
+                error_code="ticket_unknown",
+                details=_start_failure_details(
+                    state,
+                    ticket,
+                    target_head=start_sha,
+                    predecessors=[],
+                    reason="ticket is not declared in the validated batch plan",
+                ),
+            )
+        if ticket not in runnable:
+            reason = str(
+                frontier["blocked"].get(ticket, {}).get("reason", "ticket is not runnable")
+            )
+            raise BatchPlanError(
+                f"ticket {ticket!r} is not in the current runnable frontier",
+                error_code="ticket_not_runnable",
+                details=_start_failure_details(
+                    state,
+                    ticket,
+                    target_head=start_sha,
+                    status=str(record["status"]),
+                    predecessors=list(record["dependencies"])
+                    if str(record["status"]) in RUNNABLE_STATUSES
+                    else [],
+                    reason=reason,
+                ),
+            )
+
+        token = uuid.uuid4().hex[:12]
+        slug = ticket_slug(ticket)
+        worker_branch = branch_name or f"codex/matt-ticket/{slug}-{token}"
+        try:
+            run_git(main_repo, "check-ref-format", "--branch", worker_branch)
+        except RuntimeError as error:
+            raise BatchPlanError(
+                f"worker branch is invalid: {worker_branch}",
+                error_code="worker_branch_invalid",
+                details={"branch": worker_branch},
+            ) from error
+        if (
+            run_git_process(
+                main_repo, "show-ref", "--verify", "--quiet", f"refs/heads/{worker_branch}"
+            ).returncode
+            == 0
+        ):
+            raise BatchPlanError(
+                f"worker branch already exists: {worker_branch}",
+                error_code="worker_branch_exists",
+                details={"branch": worker_branch, "ticket": ticket},
+            )
+
+        if worktree_root is None:
+            worktree_root_path = Path(tempfile.gettempdir()) / "matt-implement-adapter" / "worktrees"
+        else:
+            worktree_root_path = Path(worktree_root).expanduser().resolve()
+        worktree_path = worktree_root_path / slug
+        if worktree_path.exists():
+            raise BatchPlanError(
+                f"worker worktree already exists: {worktree_path}",
+                error_code="worker_worktree_exists",
+                details={"worktree": str(worktree_path), "ticket": ticket},
+            )
+
+        state_dir = Path(tempfile.gettempdir()) / "matt-implement-adapter" / "states"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        ticket_state_path = state_dir / f"{uuid.uuid4().hex}.json"
+        frontier_generation = int(state.get("frontier_generation", 0))
+        ticket_state: dict[str, object] = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "repo": str(main_repo),
+            "worktree": str(worktree_path),
+            "ticket": ticket,
+            "base_branch": base_branch,
+            "branch": worker_branch,
+            "start_sha": start_sha,
+            "verified_start_sha": start_sha,
+            "target_head": start_sha,
+            "target_branch": base_branch,
+            "state_path": str(ticket_state_path),
+            "status": "started",
+            "verified": True,
+            "batch_state": str(batch_state_path),
+            "batch_state_path": str(batch_state_path),
+            "batch_id": state.get("batch_id"),
+            "frontier_generation": frontier_generation,
+            "predecessor_evidence": {},
+            "predecessor_integration_evidence": {},
+        }
+
+        try:
+            run_git(
+                main_repo,
+                "worktree",
+                "add",
+                "-b",
+                worker_branch,
+                str(worktree_path),
+                start_sha,
+            )
+            _atomic_write_json(ticket_state_path, ticket_state)
+
+            record["status"] = "started"
+            ticket_states = state.setdefault("ticket_states", {})
+            if not isinstance(ticket_states, dict):
+                raise BatchPlanError(
+                    "ticket_states must be a JSON object",
+                    error_code="batch_state_corrupt",
+                )
+            ticket_states[ticket] = ticket_state
+            next_frontier = _calculate_frontier(state)
+            state["frontier"] = list(next_frontier["frontier"])
+            state["runnable"] = list(next_frontier["runnable"])
+            _atomic_write_json(batch_state_path, state)
+        except (OSError, RuntimeError, BatchPlanError):
+            if worktree_path.exists():
+                run_git(main_repo, "worktree", "remove", "--force", str(worktree_path), check=False)
+            run_git(main_repo, "branch", "-D", worker_branch, check=False)
+            ticket_state_path.unlink(missing_ok=True)
+            raise
+
+        return ticket_state
 
 
 def finish_boundary(state_arg: str) -> dict[str, object]:
@@ -870,6 +1178,10 @@ def main() -> int:
     start_parser = subparsers.add_parser("start")
     start_parser.add_argument("--repo", required=True)
     start_parser.add_argument("--ticket", required=True)
+    start_parser.add_argument(
+        "--batch-state",
+        help="path to the validated batch plan state (required for every multi-ticket start)",
+    )
     start_parser.add_argument("--worktree-root")
     start_parser.add_argument("--branch")
 
@@ -904,6 +1216,7 @@ def main() -> int:
             result = start_boundary(
                 args.repo,
                 args.ticket,
+                batch_state=args.batch_state,
                 worktree_root=args.worktree_root,
                 branch_name=args.branch,
             )

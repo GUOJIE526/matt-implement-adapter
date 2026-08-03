@@ -50,15 +50,37 @@ class TicketBoundaryIntegrationTests(unittest.TestCase):
         (self.repo / "README.md").write_text("base\n", encoding="utf-8")
         git(self.repo, "add", "README.md")
         git(self.repo, "commit", "-m", "base")
+        self.batch_state = self.root / "batch-state.json"
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
     def start_ticket(self, ticket: str) -> dict[str, object]:
+        if not self.batch_state.exists():
+            ticket_boundary.create_batch_plan(
+                str(self.repo),
+                str(self.batch_state),
+                target_branch="main",
+                starting_sha=git(self.repo, "rev-parse", "HEAD"),
+                tickets=[
+                    {"ticket": ticket},
+                    {"ticket": f"peer-{ticket}"},
+                ],
+            )
         return ticket_boundary.start_boundary(
             str(self.repo),
             ticket,
+            batch_state=self.batch_state,
             worktree_root=self.root / "worktrees",
+        )
+
+    def create_batch_plan(self, tickets: list[str]) -> None:
+        ticket_boundary.create_batch_plan(
+            str(self.repo),
+            str(self.batch_state),
+            target_branch="main",
+            starting_sha=git(self.repo, "rev-parse", "HEAD"),
+            tickets=[{"ticket": ticket} for ticket in tickets],
         )
 
     def commit_worker_change(self, state: dict[str, object], content: str) -> None:
@@ -117,6 +139,7 @@ class TicketBoundaryIntegrationTests(unittest.TestCase):
         self.assertEqual(git(self.repo, "branch", "--list", str(state["branch"])), "")
 
     def test_conflicting_integration_is_recorded_for_main_agent(self) -> None:
+        self.create_batch_plan(["ticket-first", "ticket-second"])
         first = self.start_ticket("ticket-first")
         second = self.start_ticket("ticket-second")
 

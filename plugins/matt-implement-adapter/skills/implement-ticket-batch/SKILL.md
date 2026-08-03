@@ -25,6 +25,8 @@ each ticket worker owns the complete Matt workflow for exactly one ticket.
    worktree is not clean.
 3. Freeze the current target branch and starting SHA before opening the frontier. Do not integrate into
    that branch while the initial frontier worktrees are being created.
+   Persist a validated batch plan with `plan create` before invoking any worker start, and pass its state
+   path to each start command.
 4. Order tickets by their blocking graph and work only the open, unblocked frontier. Independent tickets
    in the same frontier may run in parallel; a dependent ticket waits until its predecessors are integrated
    and the required checks pass.
@@ -33,7 +35,8 @@ each ticket worker owns the complete Matt workflow for exactly one ticket.
    ```powershell
    python "<this-skill-directory>\scripts\ticket_boundary.py" start `
      --repo "<main-repo-root>" `
-     --ticket "<ticket-reference>"
+     --ticket "<ticket-reference>" `
+     --batch-state "<validated-batch-state>"
    ```
 
    Resolve `<this-skill-directory>` from the loaded `SKILL.md` path. Retain every returned `state_path`,

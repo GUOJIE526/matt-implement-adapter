@@ -207,6 +207,21 @@ class BatchPlanCliTests(unittest.TestCase):
         self.assertEqual(error["error_code"], "single_ticket_batch")
         self.assertFalse(self.state.exists())
 
+    def test_colliding_worktree_slugs_are_rejected_before_state_creation(self) -> None:
+        completed = self.create(
+            [
+                {"ticket": "foo/bar"},
+                {"ticket": "foo-bar"},
+            ]
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        error = json.loads(completed.stderr)
+        self.assertFalse(error["verified"])
+        self.assertEqual(error["error_code"], "invalid_batch_plan")
+        self.assertEqual(error["details"]["worktree_slug_collisions"]["foo-bar"], ["foo-bar", "foo/bar"])
+        self.assertFalse(self.state.exists())
+
     def test_missing_corrupt_and_unsupported_state_fail_closed(self) -> None:
         missing = self.cli("plan", "frontier", "--state", str(self.root / "missing.json"))
         self.assertNotEqual(missing.returncode, 0)
