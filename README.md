@@ -91,6 +91,30 @@ codex plugin marketplace add git@github.com:GUOJIE526/matt-implement-adapter.git
 codex plugin list | Select-String "matt-implement-adapter"
 ```
 
+### 安裝 Pre-release 版本
+
+Pre-release 版本從 `staging` branch 發布。GitHub Release 的 Pre-release 標記不會自動改變
+Codex marketplace 使用的版本；安裝時必須明確指定 `--ref staging`。
+
+全新安裝 Pre-release：
+
+```powershell
+codex plugin marketplace add GUOJIE526/matt-implement-adapter --ref staging
+codex plugin add matt-implement-adapter@matt-adapter
+```
+
+如果已安裝從 `main` 取得的 stable 版本，先移除既有 plugin 與 marketplace snapshot，再改用
+`staging`：
+
+```powershell
+codex plugin remove matt-implement-adapter@matt-adapter
+codex plugin marketplace remove matt-adapter
+codex plugin marketplace add GUOJIE526/matt-implement-adapter --ref staging
+codex plugin add matt-implement-adapter@matt-adapter
+```
+
+安裝後請開啟新的 Codex task，並用 `codex plugin list` 確認 plugin 已載入。
+
 ## 更新
 
 上傳新版本後，在使用端執行：
@@ -105,4 +129,4 @@ codex plugin add matt-implement-adapter@matt-adapter
 升級時，batch state 是 scheduler 的 durable source of truth；resume 或 context compaction 後應重新載入
 state 並查詢 `status`/`frontier`，不要從 conversation memory 重建進度。既有 pre-batch worker state 可用
 `plan import`/`legacy import` 安全恢復；恢復時會驗證 repository、target branch、ticket identity、Git
-ancestry 與明確 verification，完成前不得解鎖新的 dependent。此 ticket 不執行 release 或 marketplace upgrade。
+ancestry 與明確 verification，完成前不得解鎖新的 dependent。

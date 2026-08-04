@@ -1,6 +1,6 @@
 {
   "name": "matt-implement-adapter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Runs multi-ticket Matt implement work with one fresh isolated Codex subagent per ticket and dependency-ordered integration from a validated batch plan.",
   "author": {
     "name": "GGHong"
