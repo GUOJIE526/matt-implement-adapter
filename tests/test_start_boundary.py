@@ -87,6 +87,40 @@ class BatchStartCliTests(unittest.TestCase):
             *extra,
         )
 
+    def assert_dependent_start_rejected(
+        self,
+        completed: subprocess.CompletedProcess[str],
+        *,
+        error_codes: set[str] | None = None,
+        unmet_predecessors: list[str] | None = None,
+        required_gate_prefix: str | None = None,
+    ) -> dict[str, object]:
+        self.assertNotEqual(completed.returncode, 0, completed.stdout)
+        error = json.loads(completed.stderr)
+        self.assertFalse(error["verified"])
+        if error_codes is not None:
+            self.assertIn(error["error_code"], error_codes)
+        details = error["details"]
+        self.assertEqual(details["ticket"], "02")
+        self.assertEqual(details["status"], "planned")
+        self.assertIn("unmet_predecessors", details)
+        self.assertIn("gates", details)
+        self.assertIn("target_head", details)
+        if unmet_predecessors is not None:
+            self.assertEqual(details["unmet_predecessors"], unmet_predecessors)
+        if required_gate_prefix is not None:
+            self.assertTrue(
+                any(str(gate).startswith(required_gate_prefix) for gate in details["gates"])
+            )
+
+        self.assertFalse((self.worktrees / "02").exists())
+        self.assertEqual(self.git("branch", "--list", "codex/matt-ticket/02-*"), "")
+        persisted = json.loads(self.state.read_text(encoding="utf-8"))
+        records = {record["ticket"]: record for record in persisted["tickets"]}
+        self.assertEqual(records["02"]["status"], "planned")
+        self.assertNotIn("02", persisted.get("ticket_states", {}))
+        return error
+
     def test_start_without_batch_state_fails_closed_with_migration_guidance(self) -> None:
         completed = self.cli(
             "start", "--repo", str(self.repo), "--ticket", "01"
@@ -169,6 +203,76 @@ class BatchStartCliTests(unittest.TestCase):
         self.assertFalse((self.worktrees / "02").exists())
         self.assertEqual(self.git("branch", "--list", "codex/matt-ticket/02-*"), "")
 
+    def test_finished_predecessor_without_integration_stays_blocked(self) -> None:
+        self.create_plan(
+            [
+                {"ticket": "01"},
+                {"ticket": "02", "dependencies": ["01"]},
+            ]
+        )
+        started = json.loads(self.start("01").stdout)
+        worker = Path(str(started["worktree"]))
+        (worker / "feature.txt").write_text("01\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worker), "add", "feature.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(worker), "commit", "-m", "ticket 01"], check=True
+        )
+        finished = self.cli("finish", "--state", str(started["state_path"]))
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+
+        persisted = json.loads(self.state.read_text(encoding="utf-8"))
+        predecessor = next(record for record in persisted["tickets"] if record["ticket"] == "01")
+        self.assertEqual(predecessor["status"], "finished")
+        self.assertNotIn("integration", predecessor)
+
+        self.assert_dependent_start_rejected(
+            self.start("02"),
+            error_codes={"ticket_not_runnable"},
+            unmet_predecessors=["01"],
+        )
+
+    def test_failed_predecessor_verification_keeps_dependent_blocked(self) -> None:
+        self.create_plan(
+            [
+                {"ticket": "01", "required_checks": []},
+                {"ticket": "02", "dependencies": ["01"]},
+            ]
+        )
+        started = json.loads(self.start("01").stdout)
+        worker = Path(str(started["worktree"]))
+        (worker / "feature.txt").write_text("01\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worker), "add", "feature.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(worker), "commit", "-m", "ticket 01"], check=True
+        )
+        self.assertEqual(
+            self.cli("finish", "--state", str(started["state_path"])).returncode,
+            0,
+        )
+        self.assertEqual(
+            self.cli("integrate", "--state", str(started["state_path"])).returncode,
+            0,
+        )
+        failed = self.cli(
+            "verify",
+            "--batch-state",
+            str(self.state),
+            "--ticket",
+            "01",
+            "--result",
+            "failed",
+        )
+        self.assertEqual(failed.returncode, 0, failed.stderr)
+        verification = json.loads(failed.stdout)
+        self.assertEqual(verification["verification_result"], "failed")
+
+        self.assert_dependent_start_rejected(
+            self.start("02"),
+            error_codes={"ticket_not_runnable"},
+            unmet_predecessors=[],
+            required_gate_prefix="01:",
+        )
+
     def test_passed_verification_unlocks_dependent_from_verified_target_head(self) -> None:
         self.create_plan(
             [
@@ -211,6 +315,103 @@ class BatchStartCliTests(unittest.TestCase):
         self.assertTrue(dependent_state["predecessor_evidence"]["01"]["ancestor"])
 
         self.cli("cleanup", "--state", str(started["state_path"]))
+
+    def test_conflict_recovery_keeps_dependent_blocked_until_verified(self) -> None:
+        self.create_plan(
+            [
+                {"ticket": "01", "required_checks": []},
+                {"ticket": "02", "dependencies": ["01"]},
+            ]
+        )
+        started = json.loads(self.start("01").stdout)
+        worker = Path(str(started["worktree"]))
+        (worker / "README.md").write_text("ticket 01\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worker), "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(worker), "commit", "-m", "ticket 01"], check=True
+        )
+        self.assertEqual(
+            self.cli("finish", "--state", str(started["state_path"])).returncode,
+            0,
+        )
+
+        (self.repo / "README.md").write_text("target main\n", encoding="utf-8")
+        self.git("add", "README.md")
+        self.git("commit", "-m", "target change")
+        conflicting = self.cli("integrate", "--state", str(started["state_path"]))
+        self.assertNotEqual(conflicting.returncode, 0)
+        self.assertEqual(json.loads(conflicting.stderr)["error_code"], "lifecycle_error")
+
+        persisted = json.loads(self.state.read_text(encoding="utf-8"))
+        predecessor = next(record for record in persisted["tickets"] if record["ticket"] == "01")
+        self.assertEqual(predecessor["status"], "integration_conflict")
+        self.assertIn("integration_error", predecessor)
+        self.assert_dependent_start_rejected(
+            self.start("02"),
+            error_codes={"target_worktree_dirty"},
+        )
+
+        (self.repo / "README.md").write_text("target main\nticket 01\n", encoding="utf-8")
+        self.git("add", "README.md")
+        resolved = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "-c",
+                "core.editor=true",
+                "cherry-pick",
+                "--continue",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        integrated_commit = self.git("rev-parse", "HEAD")
+
+        self.assert_dependent_start_rejected(
+            self.start("02"),
+            error_codes={"target_head_stale"},
+        )
+
+        continued = self.cli(
+            "integrate",
+            "--state",
+            str(started["state_path"]),
+            "--continue",
+        )
+        self.assertEqual(continued.returncode, 0, continued.stderr)
+        self.assertEqual(json.loads(continued.stdout)["status"], "integrated")
+
+        self.assert_dependent_start_rejected(
+            self.start("02"),
+            error_codes={"ticket_not_runnable"},
+            unmet_predecessors=[],
+            required_gate_prefix="01:",
+        )
+
+        verified = self.cli(
+            "verify",
+            "--batch-state",
+            str(self.state),
+            "--ticket",
+            "01",
+            "--result",
+            "passed",
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(json.loads(verified.stdout)["verification_result"], "passed")
+        self.assertEqual(
+            self.cli("cleanup", "--state", str(started["state_path"])).returncode,
+            0,
+        )
+
+        dependent = self.start("02")
+        self.assertEqual(dependent.returncode, 0, dependent.stderr)
+        dependent_state = json.loads(dependent.stdout)
+        self.assertEqual(dependent_state["verified_start_sha"], integrated_commit)
+        self.assertTrue(dependent_state["predecessor_evidence"]["01"]["ancestor"])
 
     def test_verified_predecessor_unlocks_fork_frontier(self) -> None:
         self.create_plan(
