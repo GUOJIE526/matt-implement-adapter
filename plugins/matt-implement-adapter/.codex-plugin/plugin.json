@@ -1,7 +1,7 @@
 {
   "name": "matt-implement-adapter",
-  "version": "1.0.0",
-  "description": "Runs multi-ticket Matt implement work with one fresh isolated Codex subagent per ticket and dependency-ordered integration.",
+  "version": "1.0.1",
+  "description": "Runs multi-ticket Matt implement work with one fresh isolated Codex subagent per ticket and dependency-ordered integration from a validated batch plan.",
   "author": {
     "name": "GGHong"
   },
@@ -9,12 +9,12 @@
   "interface": {
     "displayName": "Matt Implement Adapter",
     "shortDescription": "Fresh Codex context and commit for every Matt ticket.",
-    "longDescription": "Adapts Matt's multi-ticket implement flow to Codex by running each approved implementation ticket in a fresh isolated worktree and subagent. Independent tickets may run in parallel; the parent integrates them in dependency order, handles conflicts and shared test resources, runs integration checks, and cleans up completed branches.",
+    "longDescription": "Adapts Matt's multi-ticket implement flow to Codex by running each approved implementation ticket in a fresh isolated worktree and subagent. Adapter activation does not imply concurrency: independent tickets may run in parallel only when the scheduler reports the same validated, unblocked frontier. The parent creates the batch plan first, integrates tickets in dependency order, handles conflicts and shared test resources, runs integration checks, and cleans up completed branches.",
     "developerName": "GGHong",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write"],
     "defaultPrompt": [
-      "Implement the approved tickets in isolated worktrees, parallelize independent tickets, and integrate them in dependency order."
+      "For multiple approved implementation tickets, create a validated batch plan first, then start only the scheduler-approved unblocked frontier; parallelism is limited to that frontier and integration remains dependency-ordered."
     ]
   }
 }
