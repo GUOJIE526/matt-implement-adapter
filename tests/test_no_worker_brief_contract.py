@@ -89,6 +89,49 @@ class NoWorkerBriefContractTests(unittest.TestCase):
             with self.subTest(helper=helper.name):
                 self.assertFalse(helper.exists())
 
+    def test_agent_contract_separates_activation_from_concurrency(self) -> None:
+        for name, document in (
+            ("session start", self.session_start),
+            ("batch skill", self.skill),
+            ("readme", self.readme),
+        ):
+            with self.subTest(document=name):
+                self.assertIn("adapter activation does not imply concurrency", document)
+                self.assertIn("validated batch plan", document)
+                self.assertIn("scheduler", document)
+                self.assertIn("frontier", document)
+
+    def test_batch_skill_requires_plan_before_scheduler_frontier_start(self) -> None:
+        self.assertIn("before invoking any worker start", self.skill)
+        self.assertIn(
+            "work only the open, unblocked frontier returned by the scheduler",
+            self.skill,
+        )
+        self.assertIn("start only the tickets it returns", self.skill)
+
+    def test_plugin_metadata_does_not_imply_all_tickets_run_in_parallel(self) -> None:
+        metadata = (
+            REPOSITORY_ROOT
+            / "plugins"
+            / "matt-implement-adapter"
+            / ".codex-plugin"
+            / "plugin.json"
+        ).read_text(encoding="utf-8").casefold()
+        agent_metadata = (
+            REPOSITORY_ROOT
+            / "plugins"
+            / "matt-implement-adapter"
+            / "skills"
+            / "implement-ticket-batch"
+            / "agents"
+            / "openai.yaml"
+        ).read_text(encoding="utf-8").casefold()
+        for document in (metadata, agent_metadata):
+            self.assertIn("validated", document)
+            self.assertIn("frontier", document)
+            self.assertNotIn("all tickets", document)
+            self.assertNotIn("parallelize independent tickets", document)
+
 
 if __name__ == "__main__":
     unittest.main()
