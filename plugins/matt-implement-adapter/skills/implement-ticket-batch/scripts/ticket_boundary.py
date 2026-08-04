@@ -99,6 +99,26 @@ class BatchPlanError(RuntimeError):
         self.details = details or {}
 
 
+class CliArgumentError(RuntimeError):
+    """A parser failure that can be returned through the CLI result contract."""
+
+    error_code = "cli_argument_error"
+
+    def __init__(self, message: str, *, parser: argparse.ArgumentParser) -> None:
+        super().__init__(message)
+        self.parser = parser
+
+
+class CliArgumentParser(argparse.ArgumentParser):
+    """Keep argparse help while routing every parse error through JSON output."""
+
+    def error(self, message: str) -> None:
+        # ``--help`` calls ``exit`` directly and therefore keeps argparse's
+        # normal human-readable, exit-code-0 behavior. Only invalid input gets
+        # converted into the machine-readable failure envelope in ``main``.
+        raise CliArgumentError(message, parser=self)
+
+
 def run_git_process(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -3186,6 +3206,84 @@ def _cli_failure_details(args: argparse.Namespace) -> dict[str, object]:
     return details
 
 
+def _argument_value(argv: list[str], *names: str) -> str | None:
+    """Extract values from argv when argparse cannot build a Namespace."""
+
+    value: str | None = None
+    for token_index, token in enumerate(argv):
+        for name in names:
+            if token == name:
+                if token_index + 1 < len(argv):
+                    candidate = argv[token_index + 1]
+                    if not candidate.startswith("-"):
+                        value = candidate
+                break
+            prefix = f"{name}="
+            if token.startswith(prefix):
+                candidate = token[len(prefix) :]
+                value = candidate or None
+                break
+    return value
+
+
+def _cli_argument_failure_details(
+    argv: list[str], error: CliArgumentError
+) -> dict[str, object]:
+    """Project known lifecycle context without inventing state after parse failure."""
+
+    ticket = _argument_value(argv, "--ticket")
+    state = _argument_value(argv, "--state", "--legacy-state")
+    batch_state = _argument_value(argv, "--batch-state")
+    details = _cli_failure_details(
+        argparse.Namespace(
+            ticket=ticket,
+            state=state,
+            legacy_state=state,
+            batch_state=batch_state,
+        )
+    )
+    if details["ticket"] is None:
+        details["ticket"] = ticket
+
+    target_branch = _argument_value(argv, "--target-branch", "--target")
+    repo = _argument_value(argv, "--repo")
+    if details["target_head"] is None and repo and target_branch:
+        try:
+            details["target_head"] = run_git(
+                resolve_repo(repo), "rev-parse", target_branch
+            )
+        except (OSError, RuntimeError, ValueError):
+            # A parse failure must remain useful even when the optional Git
+            # context is unavailable; ``null`` is the honest value here.
+            pass
+
+    known_commands = {
+        "plan",
+        "batch-plan",
+        "start",
+        "status",
+        "report",
+        "finish",
+        "integrate",
+        "verify",
+        "record-verification",
+        "verification",
+        "cleanup",
+        "legacy",
+        "import",
+        "legacy-import",
+        "recover",
+        "migrate",
+    }
+    details.update(
+        {
+            "command": argv[0] if argv and argv[0] in known_commands else None,
+            "parser": error.parser.prog,
+        }
+    )
+    return details
+
+
 def _add_legacy_import_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--batch-state", required=True)
@@ -3206,7 +3304,7 @@ def _add_legacy_import_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         description=(
             "Create and query a validated batch plan, or create, verify, integrate, "
             "and clean up one ticket's Git worktree."
@@ -3313,7 +3411,23 @@ def main() -> int:
     )
     _add_legacy_import_arguments(direct_import_parser)
 
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except CliArgumentError as error:
+        print(
+            json.dumps(
+                {
+                    "verified": False,
+                    "error": str(error),
+                    "error_code": error.error_code,
+                    "details": _cli_argument_failure_details(sys.argv[1:], error),
+                }
+            ),
+            file=sys.stderr,
+        )
+        # Keep argparse's conventional parse-error status while ensuring it
+        # remains stable and distinct from lifecycle failures (which return 1).
+        return 2
     try:
         if args.command in {"plan", "batch-plan"}:
             if args.plan_command == "create":
